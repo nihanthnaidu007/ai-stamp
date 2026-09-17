@@ -6,7 +6,6 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import pytest
 from typer.testing import CliRunner
 
 from aistamp.cli.main import app
@@ -430,20 +429,23 @@ def test_keys_rotate_missing_old_key_env() -> None:
     assert "AISTAMP_SECRET_KEY" in result.output
 
 
-def test_keys_rotate_graceful_when_api_missing(tmp_path: Path) -> None:
-    # aistamp.keys.rotate_secret is the pinned v0.2.0 API; until the crypto
-    # track lands the module the command must fail with a clear message,
-    # never a traceback.
+def test_keys_rotate_clear_error_on_uninitialized_database(tmp_path: Path) -> None:
+    # aistamp.keys.rotate_secret shipped with the tamper-evidence track, so
+    # with valid keys the command runs. A store without the aistamp schema
+    # (fresh database file, migrate never run) must still fail with an
+    # actionable message, never a traceback.
     result = runner.invoke(
         app,
         ["keys", "rotate"],
         env={
             "AISTAMP_SECRET_KEY": _SECRET,
             "AISTAMP_NEW_SECRET_KEY": "a-brand-new-secret-key-32-chars!!",
+            "AISTAMP_DATABASE_URL": f"sqlite:///{tmp_path / 'fresh.db'}",
         },
     )
     assert result.exit_code == 1
-    assert "not available" in result.output
+    assert "migrate" in result.output
+    assert "Traceback" not in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -493,11 +495,8 @@ def _write_keyring(tmp_path: Path) -> Path:
 
 
 def _populate_keyed_db(db_path: Path) -> str:
-    """A record carrying a non-default key_id via model_copy.
-
-    The ad-hoc field does not survive the store round-trip on this branch;
-    that limitation is exactly what the xfail test below documents.
-    """
+    """A record carrying a non-default key_id, persisted via the store's
+    key_id column (shipped with the tamper-evidence track)."""
     backend = SQLiteBackend(f"sqlite:///{db_path}")
     backend.create_tables()
     record = ProvenanceRecord(
@@ -555,15 +554,10 @@ def test_report_without_keyring_flags_pre_rotation_mismatch(
     assert data["records"][0]["signature_verdict"] == "INVALID"
 
 
-@pytest.mark.xfail(
-    reason="per-record key_id round-trips through the store only after the"
-    " tamper-evidence track lands the column; keyed verdicts are covered at"
-    " unit level in tests/test_audit_exports.py.",
-    strict=False,
-)
 def test_report_keyring_marks_keyed_history_unverified(tmp_path: Path) -> None:
     # Keyed record whose key is absent from the keyring: UNVERIFIED, not
-    # INVALID.
+    # INVALID. The per-record key_id column shipped with the tamper-evidence
+    # track, so the key round-trips through the store.
     db = tmp_path / "kr.db"
     _populate_keyed_db(db)
 
@@ -600,12 +594,9 @@ def test_keyring_missing_file_errors(tmp_path: Path) -> None:
     assert "Keyring file not found" in result.output
 
 
-@pytest.mark.xfail(
-    reason="aistamp.keys.rotate_secret is owned by the crypto track;"
-    " integration test once the pinned API exists on this branch.",
-    strict=False,
-)
 def test_keys_rotate_end_to_end(tmp_path: Path) -> None:
+    # aistamp.keys.rotate_secret shipped with the tamper-evidence track
+    # (PR #3): rotation against a populated store is now the pinned behavior.
     db = tmp_path / "k.db"
     _populate_db(db)
     result = runner.invoke(

@@ -10,7 +10,7 @@ from typing import Annotated
 import typer
 import yaml
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import ArgumentError
+from sqlalchemy.exc import ArgumentError, OperationalError
 
 from aistamp.audit import (
     AuditExporter,
@@ -20,7 +20,8 @@ from aistamp.audit import (
 )
 from aistamp.config import Config
 from aistamp.errors import ConfigError
-from aistamp.fingerprint import RecordNotFoundError, verify_record
+from aistamp.fingerprint import RecordNotFoundError, RotationError, verify_record
+from aistamp.keys import rotate_secret
 from aistamp.models import (
     SEVERITY_RANK,
     PIIMatch,
@@ -733,25 +734,29 @@ def keys_rotate(
         )
         raise typer.Exit(code=1)
 
+    config = _load_config(config_path)
+    backend = _get_backend(config)
     try:
-        from aistamp.keys import rotate_secret
-    except ImportError:
+        rotate_secret(
+            old_key=old_key,
+            new_key=new_key,
+            new_key_id=key_id,
+            backend=backend,
+            re_sign=re_sign,
+        )
+    except OperationalError:
+        # The store has no aistamp schema (fresh database file, or the
+        # operator skipped 'aistamp migrate'): fail with guidance, not a
+        # raw traceback.
         typer.echo(
-            "aistamp.keys.rotate_secret is not available in this build;"
-            " key rotation lands with the v0.2.0 crypto integration.",
+            "The configured database has no aistamp schema."
+            " Run 'aistamp migrate' first, then retry.",
             err=True,
         )
         raise typer.Exit(code=1) from None
-
-    config = _load_config(config_path)
-    backend = _get_backend(config)
-    rotate_secret(
-        old_key=old_key,
-        new_key=new_key,
-        new_key_id=key_id,
-        backend=backend,
-        re_sign=re_sign,
-    )
+    except RotationError as e:
+        typer.echo(f"Key rotation error: {e}", err=True)
+        raise typer.Exit(code=1) from None
     typer.echo(f"Secret key rotated. New key_id: {key_id}")
 
 
