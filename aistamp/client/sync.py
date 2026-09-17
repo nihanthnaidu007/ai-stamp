@@ -168,6 +168,13 @@ class ProvenanceClient:
 
         Per-call ``app_id`` / ``feature_id`` / ``user_id`` override the
         constructor values for this call only.
+
+        Prompt-evidence scope: ``prompt_hash`` and the persisted prompt
+        evidence cover the ``prompt`` parameter only. A multi-turn
+        ``messages`` kwarg is forwarded to the provider verbatim but its
+        prior turns are NOT hashed, redacted by ``redact_before_send``, or
+        PII-scanned — callers sending conversation history own its
+        compliance. Tracked for v0.3 via the release notes.
         """
         return self._execute(
             prompt,
@@ -229,6 +236,11 @@ class ProvenanceClient:
 
         Streaming is not retried — retrying a partially consumed stream would
         duplicate output.
+
+        ``redact_before_send`` applies here too: the outbound prompt is
+        redacted before the provider sees it, and the persisted evidence
+        covers the redacted text. The scope note in :meth:`stamp` about
+        multi-turn ``messages`` kwargs applies to streaming as well.
         """
         validate_prompt(prompt)
         if not self._supports_streaming():
@@ -256,11 +268,32 @@ class ProvenanceClient:
             usage_cell: list[tuple[int | None, int | None]] = []
             chunks: list[str] = []
             try:
+                # Parity with stamp(): what leaves the process is the redacted
+                # prompt, and the persisted evidence covers exactly that text.
+                if self._config.redact_before_send:
+                    dispatch_prompt = redact_prompt(ctx.prompt)
+                    ctx.prompt = dispatch_prompt
+                    ctx.prompt_hash = hash_content(dispatch_prompt)
+                else:
+                    dispatch_prompt = ctx.prompt
                 for chunk_text in self._stream_dispatch(
-                    ctx.prompt, resolved_model, provider_kwargs, usage_cell
+                    dispatch_prompt, resolved_model, provider_kwargs, usage_cell
                 ):
                     chunks.append(chunk_text)
                     yield chunk_text
+            except GeneratorExit:
+                # Consumer abandoned the stream: no finalize (post-call policy
+                # on a partial response could raise during teardown), but the
+                # attempt itself must stay auditable.
+                ctx.status = RecordStatus.ERROR
+                ctx.error = StampError(
+                    "stream abandoned before completion",
+                    content_id=ctx.content_id,
+                )
+                try_persist_sync(
+                    ctx, self._backend, self._config, self._on_persist_error
+                )
+                raise
             except Exception as exc:
                 ctx.status = RecordStatus.ERROR
                 ctx.error = exc

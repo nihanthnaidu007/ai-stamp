@@ -41,9 +41,9 @@ logger = logging.getLogger("aistamp.client")
 PersistErrorCallback = Callable[[ProvenanceRecord, BaseException], None]
 AsyncPersistErrorCallback = Callable[[ProvenanceRecord, BaseException], Awaitable[None]]
 
-# Upper bound for the persisted error_message (matching the String(2048)
-# column this branch adds to store/schema.py) so a pathological provider
-# message cannot fail the very write that is supposed to record it.
+# Upper bound for the persisted error_message (the store/schema.py column
+# is Text, unbounded) so a pathological provider message cannot produce an
+# unbounded row and cannot fail the very write that is supposed to record it.
 _MAX_ERROR_MESSAGE_LENGTH = 2000
 
 

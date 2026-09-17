@@ -8,6 +8,7 @@ no test ever waits on backoff delays.
 from __future__ import annotations
 
 import sys
+import threading
 import types
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -56,6 +57,7 @@ from aistamp.models import (
     PolicyAction,
     ProvenanceRecord,
     QueryFilters,
+    RecordStatus,
 )
 from aistamp.policy.engine import PolicyEngine, PolicyViolationError
 from aistamp.policy.rules import RuleConditions, RuleConfig
@@ -1605,3 +1607,156 @@ async def test_try_persist_async_build_failure_is_swallowed(
 
     monkeypatch.setattr(pipeline_module, "build_record", _boom)
     await try_persist_async(_ctx(), backend, _config(), None)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# P0 hotfix: streaming redaction parity, abandoned-stream evidence,
+# off-loop sync callables
+# ---------------------------------------------------------------------------
+
+
+def test_sync_stream_redacts_before_send(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    monkeypatch.setattr(
+        aistamp.pii,
+        "redact_text",
+        lambda text, matches=None, placeholder="[REDACTED]": placeholder,
+        raising=False,
+    )
+    _install_sdk(
+        monkeypatch, "openai", OpenAI=_FakeOpenAI, AsyncOpenAI=_FakeAsyncOpenAI
+    )
+    fake = _FakeOpenAI(stream_chunks=[_chunk("ok-1"), _chunk("-2")])
+    client = _client(fake, backend, _config(redact_before_send=True))
+
+    stream = client.stamp_stream("my email is a@b.com")
+    assert "".join(stream) == "ok-1-2"
+
+    # The provider must never see the raw prompt, and the persisted
+    # evidence must cover the redacted text.
+    assert fake.calls[0]["messages"][0]["content"] == "[REDACTED]"
+    assert stream.result.record.prompt_hash == hash_content("[REDACTED]")
+
+
+@pytest.mark.asyncio
+async def test_async_stream_redacts_before_send(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    monkeypatch.setattr(
+        aistamp.pii,
+        "redact_text",
+        lambda text, matches=None, placeholder="[REDACTED]": placeholder,
+        raising=False,
+    )
+    fake = _FakeAsyncOpenAI(stream_chunks=[_chunk("ok-1"), _chunk("-2")])
+    _install_sdk(
+        monkeypatch, "openai", OpenAI=_FakeOpenAI, AsyncOpenAI=_FakeAsyncOpenAI
+    )
+    client = AsyncProvenanceClient(
+        fake,
+        config=_config(redact_before_send=True),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+
+    chunks: list[str] = []
+    stream = await client.stamp_stream("my email is a@b.com")
+    async for chunk in stream:
+        chunks.append(chunk)
+    assert "".join(chunks) == "ok-1-2"
+
+    assert fake.calls[0]["messages"][0]["content"] == "[REDACTED]"
+    report = backend.query(QueryFilters(user_id="user"))
+    assert report.records[0].prompt_hash == hash_content("[REDACTED]")
+
+
+def test_sync_stream_abandoned_persists_error_record(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    _install_sdk(
+        monkeypatch, "openai", OpenAI=_FakeOpenAI, AsyncOpenAI=_FakeAsyncOpenAI
+    )
+    fake = _FakeOpenAI(stream_chunks=[_chunk("a"), _chunk("b"), _chunk("c")])
+    client = _client(fake, backend)
+
+    stream = client.stamp_stream("q")
+    it = stream._chunks
+    assert next(it) == "a"
+    it.close()  # abandon mid-stream: no result is ever stamped
+
+    report = backend.query(QueryFilters(user_id="user"))
+    assert report.total_count == 1
+    assert report.records[0].status == RecordStatus.ERROR
+    assert report.records[0].error_type == "StampError"
+    assert report.records[0].error_message == "stream abandoned before completion"
+
+
+@pytest.mark.asyncio
+async def test_async_stream_abandoned_persists_error_record(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    fake = _FakeAsyncOpenAI(stream_chunks=[_chunk("a"), _chunk("b"), _chunk("c")])
+    _install_sdk(
+        monkeypatch, "openai", OpenAI=_FakeOpenAI, AsyncOpenAI=_FakeAsyncOpenAI
+    )
+    client = AsyncProvenanceClient(
+        fake,
+        config=_config(),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+
+    stream = await client.stamp_stream("q")
+    agen = stream._chunks
+    assert await agen.__anext__() == "a"
+    await agen.aclose()  # abandon mid-stream
+
+    report = backend.query(QueryFilters(user_id="user"))
+    assert report.total_count == 1
+    assert report.records[0].status == RecordStatus.ERROR
+    assert report.records[0].error_type == "StampError"
+    assert report.records[0].error_message == "stream abandoned before completion"
+
+
+@pytest.mark.asyncio
+async def test_async_sync_callable_runs_off_loop(backend: SQLiteBackend) -> None:
+    loop_thread = threading.get_ident()
+    call_threads: list[int] = []
+
+    def blocking_llm(prompt: str) -> str:
+        call_threads.append(threading.get_ident())
+        return "ok"
+
+    client = AsyncProvenanceClient(
+        blocking_llm,
+        config=_config(),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+    result = await client.stamp("q")
+    assert result.text == "ok"
+    assert call_threads and call_threads[0] != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_async_awaitable_callable_still_works(backend: SQLiteBackend) -> None:
+    async def async_llm(prompt: str) -> str:
+        return f"hello {prompt}"
+
+    client = AsyncProvenanceClient(
+        async_llm,
+        config=_config(),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+    result = await client.stamp("q")
+    assert result.text == "hello q"
