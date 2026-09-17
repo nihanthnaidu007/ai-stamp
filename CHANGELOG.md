@@ -6,7 +6,52 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Released]
+## [Unreleased]
+
+### Added
+
+**Continuous integration (first CI for the project)**
+- `ci.yml` — ruff lint, mypy strict type-check, pytest matrix on Python
+  3.10–3.13 with a PostgreSQL 16 service container that activates the six
+  `test_store_postgres.py` integration tests, coverage upload to Codecov,
+  and a pip-audit dependency scan.
+- `build.yml` — builds the sdist and wheel and validates them with
+  `twine check` on every push and PR.
+- `publish.yml` — publishes to PyPI on `v*` tags via OpenID Connect trusted
+  publishing (no stored API token) with build provenance attestations.
+- `dependabot.yml` — weekly dependency updates for pip and GitHub Actions.
+
+**Test infrastructure**
+- Adapter tests for the OpenAI and Anthropic sync/async paths via fake SDK
+  modules injected through `sys.modules` — previously zero coverage.
+- Real-HTTP transport tests for `GenericHTTPClient` against a local HTTP
+  server — previously the HTTP path was monkeypatched out of its own tests.
+- Hypothesis property tests: hash/verify round-trip, tamper detection,
+  wrong-key rejection, redaction span non-leakage, policy severity
+  monotonicity.
+- pytest-benchmark smoke suite on the PII scanner and pipeline hot paths.
+- Optional real-model spaCy test, running only when the `nlp` extra and
+  model are installed (`pytest.importorskip`).
+- Registered pytest markers (`postgres`, `spacy`, `integration`,
+  `benchmark`), strict warning handling (`filterwarnings = error` with
+  narrowly scoped documented exceptions), and a coverage ratchet gate.
+
+**Packaging**
+- Single-sourced version from `aistamp.__version__` via PEP 621 dynamic
+  metadata (previously duplicated in two files).
+- Project URLs (homepage, repository, changelog, issues) in package
+  metadata.
+- Classifiers updated: Python 3.13 added, `Python :: 3 :: Only` added,
+  Development Status raised Alpha → Beta.
+- Removed the committed root `PKG-INFO` and the vestigial `setup.cfg`;
+  `MANIFEST.in` now ships `CHANGELOG.md` in the sdist.
+
+**Documentation**
+- Runnable `examples/` quickstarts: callable provider, OpenAI, policy
+  block, audit export, and record verification.
+- `CONTRIBUTING.md` and `SECURITY.md`.
+- README trust-and-verification roadmap (key rotation, retention,
+  re-verification — upcoming 0.2 capabilities).
 
 ---
 

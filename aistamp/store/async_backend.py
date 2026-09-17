@@ -102,8 +102,8 @@ class AsyncSQLiteBackend(_AsyncSQLAlchemyBackend):
     """
     Async SQLite backend using aiosqlite.
 
-    Requires ``aiosqlite`` (installed via the ``[dev]`` extra). Intended
-    primarily for testing — use ``AsyncPostgreSQLBackend`` in production.
+    Intended primarily for testing — use ``AsyncPostgreSQLBackend`` in
+    production.
     """
 
     def __init__(

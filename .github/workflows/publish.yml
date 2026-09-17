@@ -1,0 +1,35 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    name: Publish to PyPI (trusted publishing)
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # PyPI trusted publishing (OIDC) — no API token stored anywhere.
+      id-token: write
+      # Sigstore-style build provenance attestations.
+      attestations: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install build tooling
+        run: pip install build twine
+      - name: Build distributions
+        run: python -m build
+      - name: Validate distributions
+        run: twine check dist/*
+      - name: Publish to PyPI
+        # Prerequisite: the PyPI project must list this GitHub repository as
+        # a trusted publisher (PyPI → Publishing → add GitHub publisher with
+        # workflow "publish.yml" and environment "pypi").
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          attestations: true
