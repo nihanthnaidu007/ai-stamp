@@ -841,6 +841,104 @@ def test_redact_before_send_off_by_default_sends_raw_prompt(
     assert seen == ["my email is a@b.com"]  # raw prompt reaches the provider
     assert result.record.prompt_hash == hash_content("my email is a@b.com")
 
+# ---------------------------------------------------------------------------
+# Streaming redaction regressions (supplementary to the P0 hotfix block below)
+#
+# The hotfix itself (streaming redaction + abandoned-stream ERROR records) is
+# covered by test_sync/async_stream_redacts_before_send and
+# test_sync/async_stream_abandoned_persists_error_record further down. These
+# tests pin the complementary behavior: redact_before_send=False is unchanged,
+# and streaming fails closed when redaction is configured but redact_text is
+# unavailable (nothing reaches the provider, an ERROR record is persisted).
+# ---------------------------------------------------------------------------
+
+
+def test_stream_redact_before_send_off_sends_raw_prompt(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    """With redact_before_send=False the sync streaming path is unchanged."""
+    fake = _FakeOpenAI(stream_chunks=[_chunk("hi")])
+    _install_sdk(
+        monkeypatch, "openai", OpenAI=_FakeOpenAI, AsyncOpenAI=_FakeAsyncOpenAI
+    )
+    client = _client(fake, backend)  # default Config: redact_before_send=False
+    stream = client.stamp_stream("my email is a@b.com")
+    assert list(stream) == ["hi"]
+    assert fake.calls[0]["messages"] == [
+        {"role": "user", "content": "my email is a@b.com"}
+    ]
+    assert stream.result.record.prompt_hash == hash_content("my email is a@b.com")
+
+
+@pytest.mark.asyncio
+async def test_async_stream_redact_before_send_off_sends_raw_prompt(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    """With redact_before_send=False the async streaming path is unchanged."""
+    fake = _FakeAsyncOpenAI(stream_chunks=[_chunk("hi")])
+    _install_sdk(
+        monkeypatch, "openai", OpenAI=_FakeOpenAI, AsyncOpenAI=_FakeAsyncOpenAI
+    )
+    client = AsyncProvenanceClient(
+        fake,
+        config=_config(),  # default Config: redact_before_send=False
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+    stream = await client.stamp_stream("my email is a@b.com")
+    assert [chunk async for chunk in stream] == ["hi"]
+    assert fake.calls[0]["messages"] == [
+        {"role": "user", "content": "my email is a@b.com"}
+    ]
+    assert stream.result.record.prompt_hash == hash_content("my email is a@b.com")
+
+
+def test_stream_redact_before_send_without_redact_text_refuses(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    """Streaming fails closed when redaction is configured but unavailable."""
+    monkeypatch.delattr(aistamp.pii, "redact_text", raising=False)
+    fake = _FakeOpenAI(stream_chunks=[_chunk("hi")])
+    _install_sdk(
+        monkeypatch, "openai", OpenAI=_FakeOpenAI, AsyncOpenAI=_FakeAsyncOpenAI
+    )
+    client = _client(fake, backend, _config(redact_before_send=True))
+    stream = client.stamp_stream("secret prompt")
+    with pytest.raises(AIStampError, match="redact_text"):
+        list(stream)
+    # The refusal never reached the provider and still persisted evidence.
+    assert fake.calls == []
+    report = backend.query(QueryFilters(user_id="user"))
+    assert report.total_count == 1
+    assert report.records[0].status.value == "ERROR"
+
+
+@pytest.mark.asyncio
+async def test_async_stream_redact_before_send_without_redact_text_refuses(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    monkeypatch.delattr(aistamp.pii, "redact_text", raising=False)
+    fake = _FakeAsyncOpenAI(stream_chunks=[_chunk("hi")])
+    _install_sdk(
+        monkeypatch, "openai", OpenAI=_FakeOpenAI, AsyncOpenAI=_FakeAsyncOpenAI
+    )
+    client = AsyncProvenanceClient(
+        fake,
+        config=_config(redact_before_send=True),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+    stream = await client.stamp_stream("secret prompt")
+    with pytest.raises(AIStampError, match="redact_text"):
+        [chunk async for chunk in stream]
+    assert fake.calls == []
+    report = backend.query(QueryFilters(user_id="user"))
+    assert report.total_count == 1
+    assert report.records[0].status.value == "ERROR"
 
 # ---------------------------------------------------------------------------
 # Async client
