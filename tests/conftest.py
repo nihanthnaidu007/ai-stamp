@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -114,7 +116,7 @@ def signed_record_in_store(
     sqlite_backend: SQLiteBackend,
     sample_provenance_record: ProvenanceRecord,
     sample_config: Config,
-) -> dict:
+) -> dict[str, Any]:
     hmac = sign_record(sample_provenance_record, sample_config.secret_key)
     sqlite_backend.write(sample_provenance_record, hmac)
     return {"record": sample_provenance_record, "hmac": hmac}
@@ -222,7 +224,7 @@ def experimental_high_pii_record(
 
 
 @pytest.fixture
-def mock_llm_client():
+def mock_llm_client() -> Callable[[str], str]:
     def _client(prompt: str) -> str:
         return f"Mock response to: {prompt[:30]}"
 
@@ -230,7 +232,7 @@ def mock_llm_client():
 
 
 @pytest.fixture
-def mock_llm_client_with_pii():
+def mock_llm_client_with_pii() -> Callable[[str], str]:
     def _client(prompt: str) -> str:
         return (
             "You can reach our support at support@internal-company.com for assistance."
@@ -240,7 +242,7 @@ def mock_llm_client_with_pii():
 
 
 @pytest.fixture
-def stamp_config():
+def stamp_config() -> Config:
     return Config(
         secret_key="stamp-test-secret-key-minimum-32-chars!!",
         database_url="sqlite:///:memory:",
@@ -249,7 +251,9 @@ def stamp_config():
 
 
 @pytest.fixture
-def provenance_client(mock_llm_client, stamp_config):
+def provenance_client(
+    mock_llm_client: Callable[[str], str], stamp_config: Config
+) -> ProvenanceClient:
     backend = SQLiteBackend(stamp_config.database_url)
     backend.create_tables()
     return ProvenanceClient(
@@ -260,3 +264,19 @@ def provenance_client(mock_llm_client, stamp_config):
         user_id="test_user",
         backend=backend,
     )
+
+
+# --- Quality-infrastructure fixtures (adapters / property / benchmark tracks) ---
+
+
+@pytest.fixture
+def make_record(
+    sample_provenance_record: ProvenanceRecord,
+) -> Callable[..., ProvenanceRecord]:
+    """Factory for ProvenanceRecords with targeted field overrides."""
+
+    def _factory(**overrides: Any) -> ProvenanceRecord:
+        base = sample_provenance_record.model_dump()
+        return ProvenanceRecord.model_validate({**base, **overrides})
+
+    return _factory

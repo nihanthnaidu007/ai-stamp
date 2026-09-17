@@ -40,6 +40,9 @@ build/
 *.whl
 *.tar.gz
 
+# Build artifact accidentally committed in 0.1.0 (untracked in 0.2+)
+PKG-INFO
+
 # Database files (local dev only)
 *.db
 *.sqlite
