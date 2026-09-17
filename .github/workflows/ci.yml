@@ -73,7 +73,7 @@ jobs:
         run: pytest --cov=aistamp --cov-report=term --cov-report=xml
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.13'
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v6
         with:
           files: coverage.xml
           fail_ci_if_error: false
