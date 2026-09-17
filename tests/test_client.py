@@ -418,20 +418,20 @@ def test_policy_block_on_response_pii_raises(stamp_config) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_unsupported_client_raises_stamp_error(stamp_config) -> None:
-    # A non-callable, non-OpenAI, non-Anthropic object must raise StampError.
+def test_unsupported_client_raises_on_construction(stamp_config) -> None:
+    # v0.2: unsupported clients are rejected at construction time (fail fast)
+    # with a TypeError describing the supported types.
     backend = SQLiteBackend(stamp_config.database_url)
     backend.create_tables()
-    client = ProvenanceClient(
-        object(),
-        config=stamp_config,
-        app_id="a",
-        feature_id="f",
-        user_id="u",
-        backend=backend,
-    )
-    with pytest.raises(StampError):
-        client.chat("hello")
+    with pytest.raises(TypeError, match="Unsupported LLM client type"):
+        ProvenanceClient(
+            object(),
+            config=stamp_config,
+            app_id="a",
+            feature_id="f",
+            user_id="u",
+            backend=backend,
+        )
 
 
 def test_callable_returning_non_string_raises_stamp_error(stamp_config) -> None:
