@@ -30,6 +30,20 @@ class BufferedWriter:
         self._buffer: list[WritePair] = []
         self._lock = threading.Lock()
 
+    def _write_batch(self, pending: list[WritePair]) -> None:
+        """Persist one batch; re-buffer it if the backend fails.
+
+        A transient write_many error must not silently drop audit records:
+        the batch returns to the front of the buffer so the next flush
+        retries it, preserving order against concurrent adds.
+        """
+        try:
+            self._backend.write_many(pending)
+        except Exception:
+            with self._lock:
+                self._buffer = pending + self._buffer
+            raise
+
     def add(self, record: ProvenanceRecord, hmac_signature: str | None = None) -> None:
         """Buffer one record; flush automatically when the buffer is full."""
         pending: list[WritePair] = []
@@ -39,7 +53,7 @@ class BufferedWriter:
                 pending = self._buffer
                 self._buffer = []
         if pending:
-            self._backend.write_many(pending)
+            self._write_batch(pending)
 
     def flush(self) -> None:
         """Persist all buffered records now. Safe to call on an empty buffer."""
@@ -47,7 +61,12 @@ class BufferedWriter:
             pending = self._buffer
             self._buffer = []
         if pending:
-            self._backend.write_many(pending)
+            self._write_batch(pending)
+
+    def __len__(self) -> int:
+        """Number of records buffered but not yet persisted."""
+        with self._lock:
+            return len(self._buffer)
 
     def close(self) -> None:
         """Flush any remaining buffered records. Does not close the backend."""
@@ -76,6 +95,20 @@ class AsyncBufferedWriter:
         self._buffer: list[WritePair] = []
         self._lock = asyncio.Lock()
 
+    async def _write_batch(self, pending: list[WritePair]) -> None:
+        """Persist one batch; re-buffer it if the backend fails.
+
+        A transient write_many error must not silently drop audit records:
+        the batch returns to the front of the buffer so the next flush
+        retries it, preserving order against concurrent adds.
+        """
+        try:
+            await self._backend.write_many(pending)
+        except Exception:
+            async with self._lock:
+                self._buffer = pending + self._buffer
+            raise
+
     async def add(
         self, record: ProvenanceRecord, hmac_signature: str | None = None
     ) -> None:
@@ -87,7 +120,7 @@ class AsyncBufferedWriter:
                 pending = self._buffer
                 self._buffer = []
         if pending:
-            await self._backend.write_many(pending)
+            await self._write_batch(pending)
 
     async def flush(self) -> None:
         """Persist all buffered records now. Safe to call on an empty buffer."""
@@ -95,7 +128,14 @@ class AsyncBufferedWriter:
             pending = self._buffer
             self._buffer = []
         if pending:
-            await self._backend.write_many(pending)
+            await self._write_batch(pending)
+
+    def __len__(self) -> int:
+        """Number of records buffered but not yet persisted.
+
+        No lock: on the event loop a synchronous read cannot be preempted.
+        """
+        return len(self._buffer)
 
     async def close(self) -> None:
         """Flush any remaining buffered records. Does not close the backend."""

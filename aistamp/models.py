@@ -179,6 +179,15 @@ class QueryFilters(BaseModel):
             raise ValueError(
                 "keyset pagination requires both after_timestamp and after_id"
             )
+        if self.offset > 0 and (
+            self.cursor is not None
+            or self.after_timestamp is not None
+            or self.after_id is not None
+        ):
+            raise ValueError(
+                "offset paging cannot be combined with keyset pagination "
+                "(cursor or after_timestamp/after_id)"
+            )
         return self
 
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -683,3 +684,127 @@ def test_migration_matches_orm_metadata(
 
     assert _columns(db_path) == _columns(tmp_path / "createall.db")
     backend.close()
+
+
+# --- Reviewer regressions: offset paging, hmac preservation, re-buffer ------
+
+
+def test_offset_middle_page_matches_legacy_behavior(
+    file_backend: SQLiteBackend,
+) -> None:
+    """0.1.x offset paging must keep working: offset=2 skips the first two
+    rows and returns rows 3-4, never page 1 forever."""
+    base_ts = datetime(2026, 9, 17, 0, 0, tzinfo=timezone.utc)
+    contents: list[str] = []
+    for i in range(5):
+        record = _make_record(timestamp=base_ts + timedelta(seconds=i))
+        file_backend.write(record, None)
+        contents.append(record.content_id)
+
+    middle = file_backend.query(QueryFilters(limit=2, offset=2))
+    assert [r.content_id for r in middle.records] == contents[2:4]
+    last = file_backend.query(QueryFilters(limit=2, offset=4))
+    assert [r.content_id for r in last.records] == contents[4:]
+
+
+def test_offset_composes_with_filters(file_backend: SQLiteBackend) -> None:
+    base_ts = datetime(2026, 9, 17, 0, 0, tzinfo=timezone.utc)
+    for i in range(4):
+        file_backend.write(
+            _make_record(timestamp=base_ts + timedelta(seconds=i), user_id="bulk"),
+            None,
+        )
+        file_backend.write(
+            _make_record(timestamp=base_ts + timedelta(seconds=i), user_id="other"),
+            None,
+        )
+
+    all_bulk = [
+        r.content_id
+        for r in file_backend.query(QueryFilters(user_id="bulk", limit=10)).records
+    ]
+    page = file_backend.query(QueryFilters(user_id="bulk", limit=2, offset=1))
+    assert [r.content_id for r in page.records] == all_bulk[1:3]
+
+
+def test_offset_cannot_combine_with_keyset() -> None:
+    ts = datetime(2026, 9, 17, tzinfo=timezone.utc)
+    with pytest.raises(ValidationError):
+        QueryFilters(cursor="2026-09-17T00:00:00|1", offset=5)
+    with pytest.raises(ValidationError):
+        QueryFilters(after_timestamp=ts, after_id=1, offset=5)
+
+
+def test_finalize_none_preserves_existing_hmac(
+    file_backend: SQLiteBackend,
+) -> None:
+    record = _make_record()
+    file_backend.write(record, "original-hmac")
+    final = record.model_copy(update={"status": RecordStatus.COMPLETED})
+    file_backend.finalize(record.content_id, final, None)
+    fetched, hmac = file_backend.get(record.content_id) or (None, None)
+    assert fetched is not None
+    assert hmac == "original-hmac", "finalize(None) must not erase a signature"
+
+
+class _FlakyBackend:
+    """Wraps a backend; write_many fails N times before succeeding."""
+
+    def __init__(self, backend: SQLiteBackend, failures: int) -> None:
+        self._backend = backend
+        self._failures = failures
+
+    def write_many(self, items: Sequence[tuple[ProvenanceRecord, str | None]]) -> None:
+        if self._failures > 0:
+            self._failures -= 1
+            raise RuntimeError("simulated transient write failure")
+        self._backend.write_many(items)
+
+
+class _FlakyAsyncBackend:
+    """Async twin of _FlakyBackend."""
+
+    def __init__(self, backend: AsyncSQLiteBackend, failures: int) -> None:
+        self._backend = backend
+        self._failures = failures
+
+    async def write_many(
+        self, items: Sequence[tuple[ProvenanceRecord, str | None]]
+    ) -> None:
+        if self._failures > 0:
+            self._failures -= 1
+            raise RuntimeError("simulated transient write failure")
+        await self._backend.write_many(items)
+
+
+def test_buffered_writer_rebuffers_failed_batch(
+    file_backend: SQLiteBackend,
+) -> None:
+    flaky = _FlakyBackend(file_backend, failures=1)
+    writer = BufferedWriter(flaky, max_buffer_size=2)
+    writer.add(_make_record(), None)
+    # The caller must see the failure — but the batch must survive it.
+    with pytest.raises(RuntimeError, match="simulated transient write failure"):
+        writer.add(_make_record(), None)  # autoflush fires and fails
+    assert len(writer) == 2, "failed batch must be re-buffered, not dropped"
+    writer.flush()  # retry succeeds now that the backend healed
+    assert file_backend.query(QueryFilters(limit=1000)).total_count == 2
+
+
+@pytest.mark.asyncio
+async def test_async_buffered_writer_rebuffers_failed_batch(tmp_path: Path) -> None:
+    backend = AsyncSQLiteBackend(f"sqlite+aiosqlite:///{tmp_path / 'flaky.db'}")
+    await backend.create_tables()
+    try:
+        writer = AsyncBufferedWriter(
+            _FlakyAsyncBackend(backend, failures=1), max_buffer_size=2
+        )
+        await writer.add(_make_record(), None)
+        # The caller must see the failure — but the batch must survive it.
+        with pytest.raises(RuntimeError, match="simulated transient write failure"):
+            await writer.add(_make_record(), None)  # autoflush fires and fails
+        assert len(writer) == 2, "failed batch must be re-buffered, not dropped"
+        await writer.flush()  # retry succeeds now that the backend healed
+        assert (await backend.query(QueryFilters(limit=1000))).total_count == 2
+    finally:
+        await backend.close()

@@ -175,7 +175,10 @@ def _apply_record_to_orm(
     target.model = record.model
     target.prompt_hash = record.prompt_hash
     target.response_hash = record.response_hash
-    target.hmac_signature = hmac_signature
+    # Only overwrite when a signature is provided: finalize(..., None) on a
+    # row that already carries a signature must not silently erase it.
+    if hmac_signature is not None:
+        target.hmac_signature = hmac_signature
     target.prompt_tokens = record.prompt_tokens
     target.response_tokens = record.response_tokens
     target.latency_ms = record.latency_ms
@@ -298,6 +301,10 @@ def _build_query_statements(
         ProvenanceRecordORM.timestamp.asc(),
         ProvenanceRecordORM.id.asc(),
     )
+    # 0.1.x offset paging applies only when no keyset condition narrows the
+    # window — combining the two would double-advance the page.
+    if keyset_condition is None and filters.offset:
+        stmt = stmt.offset(filters.offset)
     # Fetch one extra row to detect has-more without a second query.
     stmt = stmt.limit(filters.limit + 1)
     return stmt, count_stmt
