@@ -174,6 +174,10 @@ class ChainVerificationResult(_FrozenModel):
     records_checked: int
     unchained_records: int
     issues: list[ChainIssue]
+    # Security audit P1-5: chain breaks that the purge journal explains as
+    # legitimate retention deletions. Anchored gaps produce no issues; this
+    # counts them so audits still see that the chain has purge-shaped holes.
+    anchored_gaps: int = 0
 
 
 class ChainLink(_FrozenModel):

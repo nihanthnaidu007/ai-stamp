@@ -28,7 +28,7 @@ import hashlib
 import hmac as hmac_lib
 import json
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import timezone
 from typing import TYPE_CHECKING
 
@@ -41,6 +41,7 @@ from aistamp.models import (
     ChainLink,
     ChainVerificationResult,
     ProvenanceRecord,
+    PurgeAnchor,
     QueryFilters,
     SignatureStatus,
     VerificationResult,
@@ -377,6 +378,34 @@ def _fetch_scope_records(
             return records
 
 
+def _purged_back_references(anchors: Sequence[PurgeAnchor]) -> set[str | None]:
+    """prev_hash values journaled by purges, including None for purged heads."""
+    return {h for anchor in anchors for h in anchor.deleted_prev_hashes}
+
+
+def _gap_is_anchored(
+    anchors: Sequence[PurgeAnchor],
+    *,
+    surviving_predecessor: ProvenanceRecord | None,
+) -> bool:
+    """Whether the chain gap in front of the next surviving record is explained
+    by a retention purge (security audit P1-5).
+
+    ``purge()`` journals the ``prev_hash`` column of every row it deletes. For
+    a purged stretch ``r_{P+1}..r_{S-1}`` between survivors ``r_P`` and ``r_S``,
+    those journaled values are ``record_hash(r_P) .. record_hash(r_{S-2})`` —
+    the first purged record's back-pointer names the surviving predecessor.
+    ``record_hash`` binds content_id, so a match proves r_P's immediate
+    successor was legitimately purged; forging it would require a journal row,
+    which ``purge()`` only writes in the same transaction as real deletes.
+    A purged chain *head* (``r_0``) is journaled as ``None`` (no predecessor).
+    """
+    journal = _purged_back_references(anchors)
+    if surviving_predecessor is None:
+        return None in journal
+    return record_hash(surviving_predecessor) in journal
+
+
 def build_chain_link(backend: StoreBackend, scope: tuple[str, str]) -> ChainLink:
     """Produce the link data for the next record in a scope's chain.
 
@@ -407,6 +436,15 @@ def verify_chain(
     dangling predecessors) and reordered/inconsistent links (including altered
     records whose neighbors' ``prev_hash`` no longer matches). Records without
     ``scope_sequence`` are not part of any chain and are only counted.
+
+    Retention purges are part of the protocol, not tampering (security audit
+    P1-5): a break is *anchored* when the purge journal holds the back-pointer
+    of the first purged record — ``record_hash`` of the surviving predecessor,
+    or ``None`` when the purged stretch includes the chain head. Anchored gaps
+    produce no issues and are counted in ``anchored_gaps``; unexplained breaks
+    still report MISSING/REORDERED. The journal stores back-pointers, not the
+    purged rows' own hashes, so an anchored gap cannot re-verify the survivor's
+    ``prev_hash`` — suppressing that check is by design, not an oversight.
     """
     app_id, feature_id = scope
     records = _fetch_scope_records(backend, app_id, feature_id)
@@ -417,37 +455,62 @@ def verify_chain(
     )
 
     issues: list[ChainIssue] = []
+    anchored_gaps = 0
+    # Fetched lazily: the anchor query only runs when a purge-shaped break
+    # actually appears in the walk.
+    purge_anchors: list[PurgeAnchor] | None = None
+
+    def _anchors() -> list[PurgeAnchor]:
+        nonlocal purge_anchors
+        if purge_anchors is None:
+            purge_anchors = backend.list_purge_anchors()
+        return purge_anchors
+
     # (scope_sequence, record) of the previous chained record, or None at the
     # head. One variable so the not-None branch narrows both at once.
     previous: tuple[int, ProvenanceRecord] | None = None
 
     for sequence, rec in sequenced:
         if previous is None:
-            if sequence != 0:
-                issues.append(
-                    ChainIssue(
-                        kind=ChainIssueKind.MISSING,
-                        sequence=sequence,
-                        content_id=rec.content_id,
-                        detail=(
-                            f"chain starts at scope_sequence {sequence}, expected 0; "
-                            "earlier records are missing from this scope"
-                        ),
+            # A purge can only remove a head segment (r_0 .. r_{N-1}) when the
+            # journal holds a None back-pointer AND the survivor still carries
+            # a real pointer to the purged r_{N-1}. A record at sequence 0
+            # with a non-None prev_hash, or a head-gap survivor with a null
+            # pointer, is not purge-shaped and stays flagged.
+            head_gap_anchored = (
+                sequence != 0
+                and rec.prev_hash is not None
+                and _gap_is_anchored(_anchors(), surviving_predecessor=None)
+            )
+            if head_gap_anchored:
+                anchored_gaps += 1
+            else:
+                if sequence != 0:
+                    issues.append(
+                        ChainIssue(
+                            kind=ChainIssueKind.MISSING,
+                            sequence=sequence,
+                            content_id=rec.content_id,
+                            detail=(
+                                f"chain starts at scope_sequence {sequence}, "
+                                "expected 0; earlier records are missing from "
+                                "this scope"
+                            ),
+                        )
                     )
-                )
-            if rec.prev_hash is not None:
-                issues.append(
-                    ChainIssue(
-                        kind=ChainIssueKind.MISSING,
-                        sequence=sequence,
-                        content_id=rec.content_id,
-                        detail=(
-                            "first chained record references prev_hash "
-                            f"{rec.prev_hash[:12]}…, but no earlier record exists "
-                            "in this scope"
-                        ),
+                if rec.prev_hash is not None:
+                    issues.append(
+                        ChainIssue(
+                            kind=ChainIssueKind.MISSING,
+                            sequence=sequence,
+                            content_id=rec.content_id,
+                            detail=(
+                                "first chained record references prev_hash "
+                                f"{rec.prev_hash[:12]}…, but no earlier record exists "
+                                "in this scope"
+                            ),
+                        )
                     )
-                )
         else:
             prev_sequence, prev_record = previous
             if sequence == prev_sequence:
@@ -463,20 +526,30 @@ def verify_chain(
                     )
                 )
             else:
-                if sequence != prev_sequence + 1:
-                    issues.append(
-                        ChainIssue(
-                            kind=ChainIssueKind.MISSING,
-                            sequence=sequence,
-                            content_id=rec.content_id,
-                            detail=(
-                                f"scope_sequence gap: expected {prev_sequence + 1}, "
-                                f"found {sequence}"
-                            ),
+                has_gap = sequence != prev_sequence + 1
+                gap_anchored = has_gap and _gap_is_anchored(
+                    _anchors(), surviving_predecessor=prev_record
+                )
+                if has_gap:
+                    if gap_anchored:
+                        anchored_gaps += 1
+                    else:
+                        issues.append(
+                            ChainIssue(
+                                kind=ChainIssueKind.MISSING,
+                                sequence=sequence,
+                                content_id=rec.content_id,
+                                detail=(
+                                    f"scope_sequence gap: expected "
+                                    f"{prev_sequence + 1}, found {sequence}"
+                                ),
+                            )
                         )
-                    )
                 expected_prev = record_hash(prev_record)
-                if rec.prev_hash != expected_prev:
+                if rec.prev_hash != expected_prev and not gap_anchored:
+                    # When the gap is anchored, the true predecessor was
+                    # purged and the survivor's pointer names purged content
+                    # whose hash is unrecoverable — the mismatch is expected.
                     found_prev = (
                         rec.prev_hash[:12] if rec.prev_hash is not None else "null"
                     )
@@ -501,4 +574,5 @@ def verify_chain(
         records_checked=len(sequenced),
         unchained_records=unchained,
         issues=issues,
+        anchored_gaps=anchored_gaps,
     )

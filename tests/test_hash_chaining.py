@@ -35,6 +35,7 @@ def _make_record(
     scope_sequence: int | None = None,
     prev_hash: str | None = None,
     response_text: str = "response",
+    timestamp: datetime | None = None,
 ) -> ProvenanceRecord:
     app_id, feature_id = scope
     return ProvenanceRecord(
@@ -48,7 +49,7 @@ def _make_record(
         prompt_tokens=10,
         response_tokens=20,
         latency_ms=100.0,
-        timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        timestamp=timestamp or datetime(2024, 1, 1, tzinfo=timezone.utc),
         status=RecordStatus.COMPLETED,
         pii_result=None,
         policy_decision=None,
@@ -67,8 +68,14 @@ def _write_chain_record(
     *,
     scope_sequence: int,
     prev_hash: str | None,
+    timestamp: datetime | None = None,
 ) -> ProvenanceRecord:
-    record = _make_record(scope, scope_sequence=scope_sequence, prev_hash=prev_hash)
+    record = _make_record(
+        scope,
+        scope_sequence=scope_sequence,
+        prev_hash=prev_hash,
+        timestamp=timestamp,
+    )
     _write_record(backend, record)
     return record
 
@@ -279,3 +286,145 @@ def test_chain_detection_does_not_require_key_material(
     _write_chained(sqlite_backend, _SCOPE, 2)
     result = verify_chain(sqlite_backend, _SCOPE)
     assert result.valid is True
+
+
+# ---------------------------------------------------------------------------
+# Group 3 — purge anchors (security audit P1-5)
+# ---------------------------------------------------------------------------
+
+_PURGE_NOW = datetime(2024, 1, 2, tzinfo=timezone.utc)
+_TS_OLD = datetime(2023, 12, 30, tzinfo=timezone.utc)
+_TS_NEW = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+
+def test_verify_chain_treats_purged_head_segment_as_anchored(
+    sqlite_backend: SQLiteBackend,
+) -> None:
+    # purge() removes the scope's head (r_0..r_2, journaled with r_0's None
+    # back-pointer); verify_chain reads the gap from the journal instead of
+    # reporting legitimate retention as tampering.
+    prev_hash: str | None = None
+    for sequence in range(6):
+        record = _write_chain_record(
+            sqlite_backend,
+            _SCOPE,
+            scope_sequence=sequence,
+            prev_hash=prev_hash,
+            timestamp=_TS_OLD if sequence < 3 else _TS_NEW,
+        )
+        prev_hash = record_hash(record)
+
+    assert sqlite_backend.purge(retention_days=1, now=_PURGE_NOW) == 3
+
+    result = verify_chain(sqlite_backend, _SCOPE)
+    assert result.valid is True
+    assert result.issues == []
+    assert result.anchored_gaps == 1
+    assert result.records_checked == 3
+
+
+def test_verify_chain_treats_purged_middle_record_as_anchored(
+    sqlite_backend: SQLiteBackend,
+) -> None:
+    # A purge removing exactly one middle record anchors the gap it leaves:
+    # the journal holds record_hash(r_2) (the purged r_3's back-pointer), and
+    # r_4's prev_hash points at the purged r_3 — the mismatch is expected.
+    prev_hash: str | None = None
+    for sequence in range(6):
+        record = _write_chain_record(
+            sqlite_backend,
+            _SCOPE,
+            scope_sequence=sequence,
+            prev_hash=prev_hash,
+            timestamp=_TS_OLD if sequence == 3 else _TS_NEW,
+        )
+        prev_hash = record_hash(record)
+
+    assert sqlite_backend.purge(retention_days=1, now=_PURGE_NOW) == 1
+
+    result = verify_chain(sqlite_backend, _SCOPE)
+    assert result.valid is True
+    assert result.issues == []
+    assert result.anchored_gaps == 1
+    assert result.records_checked == 5
+
+
+def test_verify_chain_anchors_purge_but_flags_later_unexplained_gap(
+    sqlite_backend: SQLiteBackend,
+) -> None:
+    # An anchored purge gap must not launder tampering elsewhere in the same
+    # scope: r_6 vanishes without a journal entry, and the 5 -> 7 gap stays
+    # flagged while the purged r_3 gap stays anchored.
+    prev_hash: str | None = None
+    records: list[ProvenanceRecord] = []
+    for sequence in range(6):
+        record = _write_chain_record(
+            sqlite_backend,
+            _SCOPE,
+            scope_sequence=sequence,
+            prev_hash=prev_hash,
+            timestamp=_TS_OLD if sequence == 3 else _TS_NEW,
+        )
+        records.append(record)
+        prev_hash = record_hash(record)
+
+    assert sqlite_backend.purge(retention_days=1, now=_PURGE_NOW) == 1
+
+    vanished = _make_record(_SCOPE, scope_sequence=6, prev_hash=record_hash(records[5]))
+    _write_chain_record(
+        sqlite_backend,
+        _SCOPE,
+        scope_sequence=7,
+        prev_hash=record_hash(vanished),
+    )
+
+    result = verify_chain(sqlite_backend, _SCOPE)
+    assert result.valid is False
+    assert result.anchored_gaps == 1
+    assert [issue.kind for issue in result.issues] == [
+        ChainIssueKind.MISSING,
+        ChainIssueKind.REORDERED,
+    ]
+    assert "expected 6, found 7" in result.issues[0].detail
+
+
+def test_verify_chain_purge_journal_from_other_scope_does_not_anchor(
+    sqlite_backend: SQLiteBackend,
+) -> None:
+    # The journal proves the specific predecessor was purged: another scope's
+    # anchor (a None back-pointer) cannot explain this scope's gaps.
+    other_scope: tuple[str, str] = ("chain-app", "other-feature")
+    _write_chain_record(
+        sqlite_backend,
+        other_scope,
+        scope_sequence=0,
+        prev_hash=None,
+        timestamp=_TS_OLD,
+    )
+    chain = _write_chained(sqlite_backend, _SCOPE, 2)
+    _write_chain_record(
+        sqlite_backend, _SCOPE, scope_sequence=3, prev_hash=record_hash(chain[-1])
+    )
+
+    # Purges only the other scope's old record.
+    assert sqlite_backend.purge(retention_days=1, now=_PURGE_NOW) == 1
+
+    result = verify_chain(sqlite_backend, _SCOPE)
+    assert result.valid is False
+    assert result.anchored_gaps == 0
+    assert [issue.kind for issue in result.issues] == [ChainIssueKind.MISSING]
+
+
+def test_verify_chain_accepts_fully_purged_scope(
+    sqlite_backend: SQLiteBackend,
+) -> None:
+    # Retention removing an entire scope leaves an empty, valid chain.
+    _write_chained(sqlite_backend, _SCOPE, 3)
+
+    assert sqlite_backend.purge(retention_days=0, now=_PURGE_NOW) == 3
+
+    result = verify_chain(sqlite_backend, _SCOPE)
+    assert result.valid is True
+    assert result.issues == []
+    assert result.anchored_gaps == 0
+    assert result.records_checked == 0
