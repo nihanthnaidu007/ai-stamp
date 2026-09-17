@@ -1,0 +1,5 @@
+# Autobuild repo policy for nihanthnaidu007/ai-stamp
+# Auto-detected from GitHub repo settings on 2026-09-17:
+# all merge methods (merge commit, squash, rebase) are enabled.
+default_branch: main
+merge_method: squash
