@@ -40,6 +40,27 @@ Please include:
 - Issues in an application built on top of ai-stamp that stem from that
   application's own configuration.
 
+## Trust boundaries: operator policy predicates
+
+Policy rules may name a callable predicate via a `module:qualname` reference
+(`aistamp.policy.engine._load_predicate`). Importing that reference is an
+**in-process code execution trust boundary**:
+
+- `importlib.import_module(module_name)` executes the referenced module's
+  top-level code inside the ai-stamp process at policy load time, and the
+  resolved callable runs in-process against every record that rule evaluates.
+- The policy YAML is an **operator-controlled artifact**, trusted at the same
+  level as the process itself: anyone who can write the policy file can
+  execute arbitrary code by referencing a module they control. Predicate
+  loading is treated as trusted operator configuration, not attacker input.
+- Consequence: never point the policy file (`--config` YAML / policy path)
+  at content untrusted parties can influence (user-uploaded files,
+  world-writable directories). Treat policy-file tampering as host code
+  execution.
+- References are validated eagerly at load time (format, import, callability)
+  so a bad reference fails loudly instead of silently disabling the rule at
+  evaluation time — that validation is a correctness guard, not a sandbox.
+
 ## Response expectations
 
 - Acknowledgment within 5 business days.
