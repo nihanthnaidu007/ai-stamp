@@ -9,6 +9,7 @@ the gates open automatically and the assertions run for real.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import get_args
 
@@ -30,6 +31,20 @@ runner = CliRunner()
 
 def _config() -> Config:
     return Config(secret_key=_SECRET, database_url="sqlite:///:memory:")
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _plain(output: str) -> str:
+    """Normalize CLI help output for substring assertions.
+
+    CI renders Typer/Rich help with ANSI color codes at a narrower terminal
+    width, which both wraps tokens (``--dry-run`` can fold across lines) and
+    interleaves escapes. Strip escapes, drop line breaks, collapse spaces.
+    """
+    no_ansi = _ANSI_RE.sub("", output).replace("\n", " ")
+    return re.sub(r" {2,}", " ", no_ansi)
 
 
 @pytest.fixture
@@ -115,7 +130,7 @@ def test_v2_18_four_state_verdicts_in_exports(backend: SQLiteBackend) -> None:
 # V2-19 ------------------------------------------------------------------------
 def test_v2_19_legacy_cli_commands_still_present() -> None:
     """The six 0.1 CLI commands stay on the app through the v2 CLI."""
-    help_text = runner.invoke(app, ["--help"]).output
+    help_text = _plain(runner.invoke(app, ["--help"]).output)
     for command in ("audit", "verify", "report", "migrate", "scan", "config"):
         assert command in help_text, f"legacy command {command!r} missing from CLI"
 
@@ -123,23 +138,23 @@ def test_v2_19_legacy_cli_commands_still_present() -> None:
 # V2-20 (PENDING policy PR #4) -------------------------------------------------
 def test_v2_20_cli_version_flag() -> None:
     """`aistamp --version` prints the package version and exits 0."""
-    if "--version" not in runner.invoke(app, ["--help"]).output:
+    if "--version" not in _plain(runner.invoke(app, ["--help"]).output):
         _features.skip_pending_pr(4, "CLI --version flag")
     result = runner.invoke(app, ["--version"])
     assert result.exit_code == 0
-    assert result.output.startswith("aistamp ")
+    assert _plain(result.output).startswith("aistamp ")
 
 
 # V2-21 (PENDING policy PR #4) -------------------------------------------------
 def test_v2_21_cli_keys_and_retention_subapps() -> None:
     """`keys rotate` and `retention enforce` (with a dry-run mode) exist."""
-    top_help = runner.invoke(app, ["--help"]).output
+    top_help = _plain(runner.invoke(app, ["--help"]).output)
     if "keys" not in top_help or "retention" not in top_help:
         _features.skip_pending_pr(4, "CLI keys/retention sub-apps")
     assert runner.invoke(app, ["keys", "rotate", "--help"]).exit_code == 0
     retention_help = runner.invoke(app, ["retention", "enforce", "--help"])
     assert retention_help.exit_code == 0
-    assert "--dry-run" in retention_help.output
+    assert "--dry-run" in _plain(retention_help.output)
 
 
 # V2-22 ----------------------------------------------------------------------
@@ -148,7 +163,7 @@ def test_v2_22_cli_evidence_command(
 ) -> None:
     """`aistamp evidence --content-id X --output pack.json` writes a pack
     whose verification block carries a four-state signature verdict."""
-    if "evidence" not in runner.invoke(app, ["--help"]).output:
+    if "evidence" not in _plain(runner.invoke(app, ["--help"]).output):
         _features.skip_pending_pr(4, "CLI evidence command")
     db_path = tmp_path / "aistamp.db"
     pack_path = tmp_path / "pack.json"
@@ -170,8 +185,8 @@ def test_v2_23_cli_automation_scan_json_and_report_manifest(
     """`scan --json` emits machine-readable findings; `report` can write a
     file with an export manifest. Ships with policy PR #4.
     """
-    scan_help = runner.invoke(app, ["scan", "--help"]).output
-    report_help = runner.invoke(app, ["report", "--help"]).output
+    scan_help = _plain(runner.invoke(app, ["scan", "--help"]).output)
+    report_help = _plain(runner.invoke(app, ["report", "--help"]).output)
     if "--json" not in scan_help or "--manifest" not in report_help:
         _features.skip_pending_pr(4, "automation-grade scan --json / report --manifest")
 
