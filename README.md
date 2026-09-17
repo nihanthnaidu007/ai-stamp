@@ -335,14 +335,15 @@ self-contained script against the current API:
 
 | Example | Shows |
 |---|---|
-| [`quickstart_callable.py`](examples/quickstart_callable.py) | Wrapping any callable LLM provider |
-| [`openai_stamp.py`](examples/openai_stamp.py) | Wrapping the real OpenAI SDK |
-| [`policy_block.py`](examples/policy_block.py) | Blocking a risky call with policy rules |
-| [`audit_export.py`](examples/audit_export.py) | Exporting the audit trail as JSON/CSV |
-| [`verify_record.py`](examples/verify_record.py) | Detecting tampering with `verify_record` |
+| [`01_quickstart.py`](examples/01_quickstart.py) | Wrapping any callable LLM provider, stamping to SQLite, tamper detection |
+| [`02_streaming_redaction.py`](examples/02_streaming_redaction.py) | Streaming capture with `redact_before_send` evidence parity |
+| [`03_async_capture.py`](examples/03_async_capture.py) | Async capture on aiosqlite with a clean `aclose()` |
+| [`04_policy_rules.py`](examples/04_policy_rules.py) | Policy rules from YAML — conditions and ALLOW/WARN/BLOCK |
+| [`05_retention_purge.py`](examples/05_retention_purge.py) | Retention purge with purge-anchor journaling |
+| [`06_evidence_pack.py`](examples/06_evidence_pack.py) | Compliance evidence pack export with verification verdicts |
 
 ```bash
-python examples/quickstart_callable.py
+python examples/01_quickstart.py
 ```
 
 ## Status
