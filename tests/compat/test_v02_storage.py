@@ -9,7 +9,7 @@ merged default moved to 2, so V2-16 supersedes it.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import _features
 import pytest
@@ -26,9 +26,9 @@ _SECRET = "compat-kit-secret-key-0-2-32-chars!!"
 _MODEL = "gpt-4o-mini"
 # Six-record chain scenario: positions 0-2 predate the purge cutoff, 3-5
 # survive it (mirrors tests/test_hash_chaining.py's anchored-head setup).
-_TS_OLD = datetime(2024, 1, 1, tzinfo=UTC)
-_TS_NEW = datetime(2024, 1, 3, tzinfo=UTC)
-_PURGE_NOW = datetime(2024, 1, 4, tzinfo=UTC)
+_TS_OLD = datetime(2024, 1, 1, tzinfo=timezone.utc)
+_TS_NEW = datetime(2024, 1, 3, tzinfo=timezone.utc)
+_PURGE_NOW = datetime(2024, 1, 4, tzinfo=timezone.utc)
 
 
 def _config() -> Config:
@@ -36,7 +36,7 @@ def _config() -> Config:
 
 
 def _aware(dt: datetime) -> datetime:
-    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
 
 def _sync_client(backend: SQLiteBackend) -> ProvenanceClient:
@@ -90,7 +90,7 @@ async def async_backend() -> AsyncSQLiteBackend:
 # V2-12 ----------------------------------------------------------------------
 def test_v2_12_sync_purge_writes_one_anchor_per_purge(backend: SQLiteBackend) -> None:
     content_ids = _stamp_three(backend)
-    now = datetime.now(UTC) + timedelta(days=2)
+    now = datetime.now(timezone.utc) + timedelta(days=2)
     purged = backend.purge(1, now=now)
     assert purged == 3
     anchors = backend.list_purge_anchors()
@@ -113,7 +113,7 @@ async def test_v2_13_async_purge_writes_one_anchor_per_purge(
     content_ids = [
         (await client.stamp(f"record {i}", _MODEL)).content_id for i in range(3)
     ]
-    now = datetime.now(UTC) + timedelta(days=2)
+    now = datetime.now(timezone.utc) + timedelta(days=2)
     purged = await async_backend.purge(1, now=now)
     assert purged == 3
     anchors = await async_backend.list_purge_anchors()
