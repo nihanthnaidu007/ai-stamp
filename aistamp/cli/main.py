@@ -19,6 +19,7 @@ from aistamp.audit import (
     signature_verdict,
 )
 from aistamp.config import Config
+from aistamp.errors import ConfigError
 from aistamp.fingerprint import RecordNotFoundError, verify_record
 from aistamp.models import (
     SEVERITY_RANK,
@@ -93,8 +94,35 @@ def _load_config(config_path: Path | None) -> Config:
         raise typer.Exit(code=1) from None
 
 
+# The CLI is synchronous by design: async-driver engines (create_async_engine)
+# crash with an opaque InvalidRequestError on create_engine, so detect them and
+# name the sync form instead. Sync mirrors of the client-v2 allowlist schemes.
+_SYNC_URL_FOR_ASYNC_SCHEME = {
+    "sqlite+aiosqlite": "sqlite",
+    "postgresql+asyncpg": "postgresql",
+}
+
+
+def _sync_database_url(database_url: str) -> str:
+    """Return the URL unchanged, or fail fast for async-driver schemes."""
+    scheme = database_url.split("://", 1)[0]
+    sync_scheme = _SYNC_URL_FOR_ASYNC_SCHEME.get(scheme)
+    if sync_scheme is not None:
+        raise ConfigError(
+            f"database_url uses the async driver {scheme!r}, which the sync CLI "
+            f"cannot open. Point the CLI at the {sync_scheme}:// form instead; "
+            "the async driver remains available to the SDK's async clients."
+        )
+    return database_url
+
+
 def _get_backend(config: Config) -> SQLiteBackend:
-    return SQLiteBackend(config.database_url)
+    try:
+        _sync_database_url(config.database_url)
+        return SQLiteBackend(config.database_url)
+    except ConfigError as e:
+        typer.echo(f"Configuration error: {e}", err=True)
+        raise typer.Exit(code=1) from None
 
 
 def _read_file_or_stdin(file: Path | None) -> str:
@@ -131,7 +159,9 @@ def audit(
     record, stored_hmac = result
 
     if format == "json":
-        exporter = AuditExporter(backend, secret_key=config.secret_key)
+        exporter = AuditExporter(
+            backend, secret_key=config.secret_key.get_secret_value()
+        )
         typer.echo(
             json.dumps(exporter.signed_record_dict(record, stored_hmac), indent=2)
         )
@@ -152,7 +182,9 @@ def audit(
             if (record.policy_decision and record.policy_decision.rule_name)
             else "no rule"
         )
-        verdict = signature_verdict(record, stored_hmac, config.secret_key)
+        verdict = signature_verdict(
+            record, stored_hmac, config.secret_key.get_secret_value()
+        )
         typer.echo(f"content_id:    {record.content_id}")
         typer.echo(f"app_id:        {record.app_id}")
         typer.echo(f"feature_id:    {record.feature_id}")
@@ -430,7 +462,7 @@ def report(
 
     exporter = AuditExporter(
         backend,
-        secret_key=config.secret_key,
+        secret_key=config.secret_key.get_secret_value(),
         verification_keyring=verification_keyring,
     )
     audit_report = exporter.query(filters)
@@ -530,7 +562,7 @@ def evidence(
     backend = _get_backend(config)
     exporter = AuditExporter(
         backend,
-        secret_key=config.secret_key,
+        secret_key=config.secret_key.get_secret_value(),
         verification_keyring=_load_keyring(keyring),
     )
 
@@ -732,10 +764,6 @@ def retention_enforce(
             help="Delete provenance records older than this many days.",
         ),
     ] = None,
-    app_id: Annotated[
-        str | None,
-        typer.Option("--app-id", help="Restrict enforcement to one app ID."),
-    ] = None,
     dry_run: Annotated[
         bool,
         typer.Option(
@@ -747,7 +775,14 @@ def retention_enforce(
         Path | None, typer.Option("--config", help="Path to YAML config file.")
     ] = None,
 ) -> None:
-    """Delete provenance records past their retention window."""
+    """Delete provenance records past their retention window (chain-global).
+
+    Every purge writes a purge anchor in the same transaction as the
+    deletes, so a later gap in the hash chain is anchored as legitimate
+    retention rather than reading as tampering. Scoping to a single app
+    is not offered: the chain is global, so a scoped purge would leave
+    unanchored gaps in the other apps' chain positions.
+    """
     if older_than_days is None:
         typer.echo(
             "--older-than-days is required (e.g. --older-than-days 90).", err=True
@@ -756,24 +791,25 @@ def retention_enforce(
     config = _load_config(config_path)
     try:
         deleted = enforce_retention(
-            database_url=config.database_url,
+            database_url=_sync_database_url(config.database_url),
             older_than_days=older_than_days,
-            app_id=app_id,
             dry_run=dry_run,
         )
+    except ConfigError as e:
+        typer.echo(f"Configuration error: {e}", err=True)
+        raise typer.Exit(code=1) from None
     except ValueError as e:
         typer.echo(f"Retention error: {e}", err=True)
         raise typer.Exit(code=1) from None
 
-    scope = f" for app {app_id!r}" if app_id else ""
     if dry_run:
         typer.echo(
-            f"Retention (dry-run): would delete {deleted} record(s){scope}"
+            f"Retention (dry-run): would delete {deleted} record(s)"
             f" older than {older_than_days} days."
         )
     else:
         typer.echo(
-            f"Retention: deleted {deleted} record(s){scope}"
+            f"Retention: deleted {deleted} record(s)"
             f" older than {older_than_days} days."
         )
 

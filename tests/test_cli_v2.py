@@ -343,6 +343,61 @@ def test_retention_enforce_dry_run(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0
     assert "would delete 1 record(s)" in result.output
+    # Dry-run is read-only: it must not manufacture purge evidence.
+    db_backend = SQLiteBackend(f"sqlite:///{db}")
+    assert db_backend.list_purge_anchors() == []
+    db_backend.close()
+
+
+def test_retention_enforce_writes_purge_anchor(tmp_path: Path) -> None:
+    # P1-5: a real enforcement run must leave an anchored chain, not an
+    # unanchored gap: the purge anchor is written in the same transaction
+    # as the deletes.
+    db = tmp_path / "ret.db"
+    old_ts = datetime.now(timezone.utc) - timedelta(days=100)
+    _populate_db(db, timestamp=old_ts)
+    _populate_db(db, timestamp=old_ts)
+    config = _config_yaml(tmp_path, f"sqlite:///{db}")
+
+    result = runner.invoke(
+        app,
+        ["retention", "enforce", "--older-than-days", "90", "--config", str(config)],
+    )
+    assert result.exit_code == 0
+    assert "deleted 2 record(s)" in result.output
+
+    db_backend = SQLiteBackend(f"sqlite:///{db}")
+    anchors = db_backend.list_purge_anchors()
+    db_backend.close()
+    assert len(anchors) == 1
+    assert anchors[0].purged_count == 2
+    assert len(anchors[0].deleted_prev_hashes) == 2
+
+
+def test_retention_enforce_rejects_async_driver(tmp_path: Path) -> None:
+    # The sync CLI cannot open async-driver engines (aiosqlite/asyncpg); it
+    # must fail fast with a clear message instead of an opaque
+    # InvalidRequestError traceback.
+    config = _config_yaml(tmp_path, f"sqlite+aiosqlite:///{tmp_path / 'ret.db'}")
+    result = runner.invoke(
+        app,
+        ["retention", "enforce", "--older-than-days", "90", "--config", str(config)],
+    )
+    assert result.exit_code == 1
+    assert "Configuration error" in result.output
+    assert "sqlite+aiosqlite" in result.output
+    assert "sqlite://" in result.output  # names the sync form to use
+
+
+def test_retention_enforce_rejects_app_scoping() -> None:
+    # The purge anchor covers the global chain, so app-scoped deletion is
+    # not offered: it would leave the other apps' chain positions
+    # unanchored and indistinguishable from tampering.
+    result = runner.invoke(
+        app,
+        ["retention", "enforce", "--older-than-days", "90", "--app-id", "x"],
+    )
+    assert result.exit_code != 0
 
 
 def test_retention_enforce_missing_window(tmp_path: Path) -> None:

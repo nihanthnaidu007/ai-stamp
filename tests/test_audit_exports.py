@@ -365,28 +365,35 @@ def test_retention_dry_run_then_delete(tmp_path: Path) -> None:
 
     db_url = f"sqlite:///{tmp_path / 'audit.db'}"
     assert enforce_retention(db_url, older_than_days=90, dry_run=True) == 2
+    # Dry-run is read-only: it must not manufacture purge evidence.
+    assert backend.list_purge_anchors() == []
     assert enforce_retention(db_url, older_than_days=90, dry_run=False) == 2
     assert enforce_retention(db_url, older_than_days=90, dry_run=True) == 0
     assert len(list(backend.query(_all_filters()).records)) == 0
 
 
-def test_retention_scopes_to_app_id(tmp_path: Path) -> None:
+def test_retention_purge_writes_purge_anchor(tmp_path: Path) -> None:
+    # P1-5: a retention purge that bulk-deleted without a purge anchor would
+    # leave unanchored hash-chain gaps indistinguishable from tampering.
+    # Deletion must go through the store purge, which anchors in the same
+    # transaction as the deletes.
     backend = _file_backend(tmp_path)
     old_ts = datetime.now(timezone.utc) - timedelta(days=100)
-    for app in ("keep_app", "purge_app"):
+    for i in range(3):
         record = _sample_record().model_copy(
-            update={"app_id": app, "timestamp": old_ts}
+            update={"user_id": f"u{i}", "timestamp": old_ts}
         )
         _write_signed(backend, record)
 
     db_url = f"sqlite:///{tmp_path / 'audit.db'}"
-    deleted = enforce_retention(
-        db_url, older_than_days=90, app_id="purge_app", dry_run=False
-    )
-    assert deleted == 1
-    remaining = backend.query(_all_filters())
-    assert remaining.total_count == 1
-    assert remaining.records[0].app_id == "keep_app"
+    deleted = enforce_retention(db_url, older_than_days=90, dry_run=False)
+
+    assert deleted == 3
+    assert backend.query(_all_filters()).total_count == 0
+    anchors = backend.list_purge_anchors()
+    assert len(anchors) == 1
+    assert anchors[0].purged_count == 3
+    assert len(anchors[0].deleted_prev_hashes) == 3
 
 
 def test_retention_rejects_nonpositive_window(tmp_path: Path) -> None:
