@@ -47,6 +47,22 @@ class PolicyAction(str, Enum):
     BLOCK = "BLOCK"
 
 
+class SignatureStatus(str, Enum):
+    """Outcome of the signature check inside a VerificationResult.
+
+    - VALID: a stored signature exists and verifies under the record's key.
+    - INVALID: a stored signature exists but does not verify (tamper suspected).
+    - UNSIGNED: no signature was stored for the record.
+    - UNKNOWN_KEY: the record's key_id is absent from the provided keyring, so
+      signature validity could not be established.
+    """
+
+    VALID = "VALID"
+    INVALID = "INVALID"
+    UNSIGNED = "UNSIGNED"
+    UNKNOWN_KEY = "UNKNOWN_KEY"
+
+
 class _FrozenModel(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -93,15 +109,17 @@ class ProvenanceRecord(_FrozenModel):
     status: RecordStatus
     pii_result: PIIResult | None
     policy_decision: PolicyDecision | None
-    # --- Pinned v0.2.0 shared fields (storage migration 0002) ---
-    # Identity of the signing key used for the HMAC signature, enabling
-    # key rotation without losing verifiability of older records.
+    # --- v0.2 tamper-evidence envelope (pinned shared interface; storage
+    # migration 0002 backfills key_id='default', sig_algo='HMAC-SHA256',
+    # record_version=1 for pre-existing rows) ---
     key_id: str = "default"
-    # Signature algorithm identifier so verification stays deterministic
-    # as algorithms evolve (e.g. future asymmetric signing).
     sig_algo: str = "HMAC-SHA256"
-    # Schema version of the record payload itself.
-    record_version: int = 1
+    # v2 is the secure default: its canonical payload binds the envelope and
+    # chain fields (key_id, sig_algo, record_version, prev_hash,
+    # scope_sequence), so rewriting chain links without the key fails record
+    # verification. v1 is the byte-pinned 0.1.x payload — set explicitly only
+    # when reproducing legacy signatures. Audit P0-1 (art_y6PXlLmn).
+    record_version: int = 2
     # Optional hash-chain link to the previous record's content hash.
     prev_hash: str | None = None
     # Monotonic sequence within a scope (e.g. one capture session), for
@@ -118,8 +136,51 @@ class VerificationResult(_FrozenModel):
     hash_match: bool
     hmac_valid: bool
     drift_detected: bool
-    original_hash: str
+    # None when the stored record has no response hash (was the "" sentinel in 0.1.x).
+    original_hash: str | None
     current_hash: str
+    # v0.2 envelope fields: which key the record claims, and the signature outcome.
+    # signature_status stays None only when constructed outside verify_record().
+    key_id: str | None = None
+    signature_status: SignatureStatus | None = None
+    # Which canonical payload version the signature was verified against. For
+    # v2 records the envelope and chain fields are inside the HMAC, so chain
+    # relinking shows up here as SignatureStatus.INVALID without verify_chain.
+    record_version: int = 1
+
+
+class ChainIssueKind(str, Enum):
+    """Structural defect detected while walking a hash chain.
+
+    MISSING covers gaps and dangling predecessors; REORDERED covers link and
+    sequence inconsistencies (including duplicated positions).
+    """
+
+    MISSING = "MISSING"
+    REORDERED = "REORDERED"
+
+
+class ChainIssue(_FrozenModel):
+    kind: ChainIssueKind
+    sequence: int | None
+    content_id: str | None
+    detail: str
+
+
+class ChainVerificationResult(_FrozenModel):
+    app_id: str
+    feature_id: str
+    valid: bool
+    records_checked: int
+    unchained_records: int
+    issues: list[ChainIssue]
+
+
+class ChainLink(_FrozenModel):
+    """Link data a writer stamps onto the next record in a scope's chain."""
+
+    scope_sequence: int
+    prev_hash: str | None
 
 
 class QueryFilters(BaseModel):

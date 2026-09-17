@@ -63,6 +63,21 @@ class StoreBackend(ABC):
         """Create all tables. Dev/testing only — use Alembic in production."""
         ...
 
+    def update_record(
+        self, record: ProvenanceRecord, hmac_signature: str | None
+    ) -> None:
+        """Replace the stored row for ``record.content_id`` in place.
+
+        Optional capability: backends that cannot rewrite records (or async
+        backends, which are not reachable from the sync rotation workflow)
+        keep this default and aistamp.keys.rotate_secret(re_sign=True) will
+        refuse them with a RotationError.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support in-place record updates; "
+            "rotate_secret(re_sign=True) requires a backend with update_record()."
+        )
+
     @abstractmethod
     def finalize(
         self,
@@ -378,6 +393,22 @@ class _SyncSQLAlchemyBackend(StoreBackend):
     def write(self, record: ProvenanceRecord, hmac_signature: str | None) -> None:
         with Session(self._engine) as session:
             session.add(_record_to_orm(record, hmac_signature))
+            session.commit()
+
+    def update_record(
+        self, record: ProvenanceRecord, hmac_signature: str | None
+    ) -> None:
+        with Session(self._engine) as session:
+            stmt = select(ProvenanceRecordORM).where(
+                ProvenanceRecordORM.content_id == record.content_id
+            )
+            row = session.execute(stmt).scalar_one_or_none()
+            if row is None:
+                raise ValueError(
+                    f"Cannot update: no provenance record with content_id "
+                    f"{record.content_id!r}"
+                )
+            _apply_record_to_orm(row, record, hmac_signature)
             session.commit()
 
     def finalize(

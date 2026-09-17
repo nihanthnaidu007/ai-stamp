@@ -1,15 +1,51 @@
 from aistamp.fingerprint.core import (
+    CanonicalizationError,
+    FingerprintError,
     RecordNotFoundError,
+    UnsupportedAlgorithmError,
+    UnsupportedRecordVersionError,
+    build_chain_link,
     generate_content_id,
     hash_content,
+    record_hash,
     sign_record,
+    verify_chain,
     verify_record,
+    verify_record_async,
+)
+from aistamp.keys import (
+    RotationError,
+    RotationReport,
+    rotate_secret,
+)
+from aistamp.models import (
+    ChainIssue,
+    ChainIssueKind,
+    ChainLink,
+    ChainVerificationResult,
+    SignatureStatus,
 )
 
 __all__ = [
+    "CanonicalizationError",
+    "ChainIssue",
+    "ChainIssueKind",
+    "ChainLink",
+    "ChainVerificationResult",
+    "FingerprintError",
     "RecordNotFoundError",
+    "RotationError",
+    "RotationReport",
+    "SignatureStatus",
+    "UnsupportedAlgorithmError",
+    "UnsupportedRecordVersionError",
+    "build_chain_link",
     "generate_content_id",
     "hash_content",
+    "record_hash",
+    "rotate_secret",
     "sign_record",
+    "verify_chain",
     "verify_record",
+    "verify_record_async",
 ]

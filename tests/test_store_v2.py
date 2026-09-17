@@ -245,7 +245,11 @@ def test_pinned_column_defaults(file_backend: SQLiteBackend) -> None:
     assert fetched is not None
     assert fetched.key_id == "default"
     assert fetched.sig_algo == "HMAC-SHA256"
-    assert fetched.record_version == 1
+    # v2 is the secure default on fresh records: its canonical payload binds
+    # the envelope and chain fields into the HMAC (tamper-evidence P0-1 fix).
+    # Pre-existing rows are backfilled to 1 by migration 0002 — that path is
+    # pinned separately in test_migrate_compat.py.
+    assert fetched.record_version == 2
     assert fetched.prev_hash is None
     assert fetched.scope_sequence is None
     assert fetched.error_type is None
