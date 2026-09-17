@@ -1,0 +1,30 @@
+# Policy rules for examples/04_policy_rules.py (reused by 06_evidence_pack.py).
+#
+# Schema (v0.2):
+#   model_tiers: model name -> tier label used by model_tier conditions.
+#   rules: evaluated in order; the FIRST matching rule decides the outcome.
+#          If nothing matches, the default action is ALLOW.
+#   conditions (both optional, AND-combined when both present):
+#     model_tier:    tier label from model_tiers above (case-insensitive).
+#     pii_severity:  match only when the record's highest PII severity is at
+#                    least this level (LOW < MEDIUM < HIGH).
+model_tiers:
+  gpt-4o-mini: standard
+  gpt-4o: standard
+  experimental-9: experimental
+
+rules:
+  - name: block-experimental-tier
+    action: BLOCK
+    conditions:
+      model_tier: experimental
+
+  - name: warn-high-pii
+    action: WARN
+    conditions:
+      pii_severity: HIGH
+
+  - name: allow-standard-tier
+    action: ALLOW
+    conditions:
+      model_tier: standard
