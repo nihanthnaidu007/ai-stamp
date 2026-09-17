@@ -5,7 +5,7 @@ import hmac as hmac_lib
 import io
 import json
 from collections.abc import Iterator, Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass
 from typing import IO, Any, Literal
 
 from aistamp.audit.manifest import ExportManifest
@@ -228,7 +228,7 @@ class AuditExporter:
             if page_size <= 0:
                 return
             page = self._backend.query(
-                replace(filters, limit=page_size, offset=offset)
+                filters.model_copy(update={"limit": page_size, "offset": offset})
             )
             if not page.records:
                 return
@@ -298,7 +298,7 @@ class AuditExporter:
     def _total_count(self, filters: QueryFilters) -> dict[str, Any]:
         # A limit-0 query returns no rows but the full count; filters_applied
         # is rebuilt from the caller's original filters, not the probe.
-        probe = self._backend.query(replace(filters, limit=0))
+        probe = self._backend.query(filters.model_copy(update={"limit": 0}))
         return {
             "generated_at": probe.generated_at.isoformat(),
             "count": probe.total_count,
@@ -314,7 +314,7 @@ class AuditExporter:
                 if isinstance(v, (RecordStatus, PIISeverity, PolicyAction))
                 else v
             )
-            for k, v in asdict(filters).items()
+            for k, v in filters.model_dump().items()
             if v is not None
         }
 
