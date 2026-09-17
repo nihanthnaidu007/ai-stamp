@@ -57,6 +57,12 @@ class PIIMatch(_FrozenModel):
     start: int
     end: int
     redacted_snippet: str
+    # Confidence that the matched span is a true PII instance, in (0.0, 1.0].
+    # 1.0 = checksum-validated or strongly structured; lower values mean the
+    # match is plausible but unverified; 0.25 = the per-type validator
+    # rejected the value, kept fail-closed so redaction still covers the
+    # span. See aistamp.pii.validators for the per-type scale.
+    confidence: float = 1.0
 
 
 class PIIResult(_FrozenModel):

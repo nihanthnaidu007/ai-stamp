@@ -16,7 +16,10 @@ if not db_url:
 config.set_main_option("sqlalchemy.url", db_url)
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # disable_existing_loggers=True (the default) would set disabled=True on
+    # every logger created before migrations run — e.g. aistamp.pii when an
+    # app migrates in-process — silencing all library logging afterwards.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

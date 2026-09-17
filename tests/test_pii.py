@@ -19,6 +19,7 @@ from aistamp.pii import (
     scan_prompt_and_response,
     scan_text,
 )
+from aistamp.pii.validators import VALIDATOR_REJECTED_CONFIDENCE
 from aistamp.store import SQLiteBackend
 
 # ---------------------------------------------------------------------------
@@ -170,8 +171,12 @@ def test_credit_card_severity_is_high() -> None:
 
 
 def test_invalid_credit_card_fails_luhn_validation() -> None:
+    # Fail-closed (audit P1-4): a Luhn-failing candidate stays a match at
+    # reduced confidence instead of silently vanishing from redaction.
     matches = scan_text("Card: 1111 1111 1111 1111")
-    assert not any(m.pattern_name == PIIType.CREDIT_CARD.value for m in matches)
+    cards = [m for m in matches if m.pattern_name == PIIType.CREDIT_CARD.value]
+    assert len(cards) == 1
+    assert cards[0].confidence == VALIDATOR_REJECTED_CONFIDENCE
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +329,7 @@ def test_spacy_unavailable_does_not_raise(monkeypatch: pytest.MonkeyPatch) -> No
     # If spaCy is not installed, use_spacy=True must not raise.
     from aistamp.pii import scanner as scanner_mod
 
-    def fake_scan(_text: str):
+    def fake_scan(_text: str, _config: object):
         return []
 
     monkeypatch.setattr(scanner_mod, "_scan_with_spacy", fake_scan)
@@ -449,7 +454,7 @@ def test_highest_severity_reflects_maximum() -> None:
     # If prompt has MEDIUM and response has HIGH, highest_severity must be HIGH.
     result = scan_prompt_and_response(
         "Email me at alice@example.com",
-        "SSN on file: 987-65-4321",
+        "SSN on file: 812-65-4321",
     )
     assert result.highest_severity == PIISeverity.HIGH
 
