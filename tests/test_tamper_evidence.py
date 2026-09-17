@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import threading
+import time
 import uuid
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +16,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 import pytest
+from sqlalchemy import event
 
 from aistamp.fingerprint import (
     CanonicalizationError,
@@ -848,4 +850,96 @@ def test_update_record_serializes_concurrent_writers(tmp_path: Path) -> None:
     assert final.error_message.startswith("worker-")
     assert final.error_message.endswith("-4")
     assert stored_signature == sign_record(final, _OLD_KEY)
+    backend.close()
+
+# ---------------------------------------------------------------------------
+# Group 11 — update_record locking mechanics (SQLite write-lock ordering)
+# ---------------------------------------------------------------------------
+
+
+def test_update_record_takes_sqlite_write_lock_before_reading(tmp_path: Path) -> None:
+    # The BEGIN IMMEDIATE fix: SQLite ignores FOR UPDATE, so the transaction
+    # must acquire its write lock BEFORE the read — otherwise the reader can
+    # load a stale snapshot and then fail its write upgrade with
+    # BUSY_SNAPSHOT (which busy_timeout does not retry). Probe statement
+    # order on the live connection.
+    backend = SQLiteBackend(f"sqlite:///{tmp_path / 'lockorder.db'}")
+    backend.create_tables()
+    record = _make_record()
+    backend.write(record, None)
+
+    statements: list[str] = []
+    engine = backend._engine  # statement-ordering probe
+
+    def _capture(
+        conn: object,
+        cursor: object,
+        statement: str,
+        parameters: object,
+        context: object,
+        executemany: object,
+    ) -> None:
+        statements.append(" ".join(statement.split()))
+
+    event.listen(engine, "before_cursor_execute", _capture)
+    try:
+        backend.update_record(
+            record.model_copy(update={"error_message": "finalized"}), "final-sig"
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", _capture)
+
+    begin_idx = next(
+        i for i, s in enumerate(statements) if s.startswith("BEGIN IMMEDIATE")
+    )
+    select_idx = next(i for i, s in enumerate(statements) if s.startswith("SELECT"))
+    assert begin_idx < select_idx, statements
+    backend.close()
+
+
+def test_update_record_waits_for_concurrent_sqlite_writer(tmp_path: Path) -> None:
+    # With another connection holding the SQLite write lock, update_record
+    # must wait (busy_timeout) and then apply cleanly — never fail with
+    # "database is locked" and never clobber the holder's committed state
+    # with a stale read.
+    backend = SQLiteBackend(f"sqlite:///{tmp_path / 'serialize.db'}")
+    backend.create_tables()
+    record = _make_record()
+    backend.write(record, None)
+
+    held = threading.Event()
+    engine = backend._engine
+
+    def hold_write_lock() -> None:
+        # Hold the write lock briefly — long enough to prove update_record
+        # waits for it (rather than failing or racing), short enough to fit
+        # inside the backend's 5s busy_timeout.
+        conn = engine.connect()
+        try:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+            conn.exec_driver_sql(
+                "UPDATE provenance_records SET error_message = 'held' "
+                f"WHERE content_id = '{record.content_id}'"
+            )
+            held.set()
+            time.sleep(0.3)
+            conn.commit()
+        finally:
+            conn.close()
+
+    worker = threading.Thread(target=hold_write_lock)
+    worker.start()
+    assert held.wait(timeout=5)
+
+    started = time.monotonic()
+    backend.update_record(
+        record.model_copy(update={"error_message": "finalized"}), "final-sig"
+    )
+    waited = time.monotonic() - started
+    worker.join(timeout=5)
+
+    assert waited >= 0.2, "update_record ran while the writer lock was held"
+    stored = backend.get(record.content_id)
+    assert stored is not None
+    assert stored[0].error_message == "finalized"
     backend.close()
