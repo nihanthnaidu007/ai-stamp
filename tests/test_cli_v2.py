@@ -391,6 +391,160 @@ def test_keys_rotate_graceful_when_api_missing(tmp_path: Path) -> None:
     assert "not available" in result.output
 
 
+# ---------------------------------------------------------------------------
+# --keyring: rotated history verifies in report/evidence
+# ---------------------------------------------------------------------------
+
+
+_ROTATED_KEY_ID = "k-2024-09"
+_OLD_KEY = "retired-signing-key-for-cli-rotation-tests-32"
+
+
+def _populate_rotated_db(db_path: Path) -> str:
+    """A 0.1.x-era record signed with the pre-rotation secret.
+
+    The store cannot carry per-record key_id until the tamper-evidence
+    track lands the column, so the expressible rotated-history case here is
+    pre-rotation records under the implicit default key id; the keyring
+    mounts the retired secret at 'default' and the active key stays in the
+    environment.
+    """
+    backend = SQLiteBackend(f"sqlite:///{db_path}")
+    backend.create_tables()
+    record = ProvenanceRecord(
+        content_id=generate_content_id(),
+        app_id="cli_test",
+        feature_id="f",
+        user_id="u",
+        model="gpt-4o",
+        prompt_hash=hash_content("a prompt"),
+        response_hash=hash_content("The answer is 42."),
+        prompt_tokens=10,
+        response_tokens=20,
+        latency_ms=100.0,
+        timestamp=datetime.now(timezone.utc),
+        status=RecordStatus.COMPLETED,
+        pii_result=None,
+        policy_decision=None,
+    )
+    backend.write(record, sign_record(record, _OLD_KEY))
+    return record.content_id
+
+
+def _write_keyring(tmp_path: Path) -> Path:
+    path = tmp_path / "keyring.yaml"
+    path.write_text(f"default: {_OLD_KEY}\n")
+    return path
+
+
+def _populate_keyed_db(db_path: Path) -> str:
+    """A record carrying a non-default key_id via model_copy.
+
+    The ad-hoc field does not survive the store round-trip on this branch;
+    that limitation is exactly what the xfail test below documents.
+    """
+    backend = SQLiteBackend(f"sqlite:///{db_path}")
+    backend.create_tables()
+    record = ProvenanceRecord(
+        content_id=generate_content_id(),
+        app_id="cli_test",
+        feature_id="f",
+        user_id="u",
+        model="gpt-4o",
+        prompt_hash=hash_content("a prompt"),
+        response_hash=hash_content("The answer is 42."),
+        prompt_tokens=10,
+        response_tokens=20,
+        latency_ms=100.0,
+        timestamp=datetime.now(timezone.utc),
+        status=RecordStatus.COMPLETED,
+        pii_result=None,
+        policy_decision=None,
+    ).model_copy(update={"key_id": _ROTATED_KEY_ID})
+    backend.write(record, sign_record(record, _OLD_KEY))
+    return record.content_id
+
+
+def test_report_keyring_verifies_rotated_history(tmp_path: Path) -> None:
+    db = tmp_path / "kr.db"
+    _populate_rotated_db(db)
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--format",
+            "json",
+            "--keyring",
+            str(_write_keyring(tmp_path)),
+        ],
+        env=_env(db),
+    )
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["records"][0]["signature_verdict"] == "VALID"
+
+
+def test_report_without_keyring_flags_pre_rotation_mismatch(
+    tmp_path: Path,
+) -> None:
+    # Without a keyring, a pre-rotation signature checked against the
+    # active secret is an active-key mismatch — still reported INVALID
+    # (tamper on the active key id must stay detectable).
+    db = tmp_path / "kr.db"
+    _populate_rotated_db(db)
+
+    result = runner.invoke(app, ["report", "--format", "json"], env=_env(db))
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["records"][0]["signature_verdict"] == "INVALID"
+
+
+@pytest.mark.xfail(
+    reason="per-record key_id round-trips through the store only after the"
+    " tamper-evidence track lands the column; keyed verdicts are covered at"
+    " unit level in tests/test_audit_exports.py.",
+    strict=False,
+)
+def test_report_keyring_marks_keyed_history_unverified(tmp_path: Path) -> None:
+    # Keyed record whose key is absent from the keyring: UNVERIFIED, not
+    # INVALID.
+    db = tmp_path / "kr.db"
+    _populate_keyed_db(db)
+
+    result = runner.invoke(app, ["report", "--format", "json"], env=_env(db))
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["records"][0]["signature_verdict"] == "UNVERIFIED"
+
+
+def test_evidence_command_accepts_keyring(tmp_path: Path) -> None:
+    db = tmp_path / "kr.db"
+    cid = _populate_rotated_db(db)
+
+    result = runner.invoke(
+        app,
+        ["evidence", "--content-id", cid, "--keyring", str(_write_keyring(tmp_path))],
+        env=_env(db),
+    )
+    assert result.exit_code == 0
+    pack = json.loads(result.output)
+    assert pack["verification"]["signature_verdict"] == "VALID"
+
+
+def test_keyring_missing_file_errors(tmp_path: Path) -> None:
+    db = tmp_path / "kr.db"
+    cid = _populate_rotated_db(db)
+
+    result = runner.invoke(
+        app,
+        ["evidence", "--content-id", cid, "--keyring", str(tmp_path / "nope.yaml")],
+        env=_env(db),
+    )
+    assert result.exit_code == 1
+    assert "Keyring file not found" in result.output
+
+
 @pytest.mark.xfail(
     reason="aistamp.keys.rotate_secret is owned by the crypto track;"
     " integration test once the pinned API exists on this branch.",
@@ -410,3 +564,4 @@ def test_keys_rotate_end_to_end(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0
     assert "Secret key rotated" in result.output
+

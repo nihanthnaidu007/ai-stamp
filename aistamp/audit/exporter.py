@@ -4,7 +4,7 @@ import csv
 import hmac as hmac_lib
 import io
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import asdict, dataclass, replace
 from typing import IO, Any, Literal
 
@@ -23,8 +23,16 @@ from aistamp.store.backend import StoreBackend
 
 SignatureVerdict = Literal["VALID", "INVALID", "MISSING", "UNVERIFIED"]
 
+# Pinned ProvenanceRecord default; the field itself lands with the
+# tamper-evidence track, so reads go through _record_key_id().
+DEFAULT_KEY_ID = "default"
+
 # Number of records fetched per backend query while streaming an export.
 _STREAM_PAGE_SIZE = 500
+
+# A cell opening with any of these is interpreted as a formula by Excel /
+# Google Sheets when the export is opened (OWASP spreadsheet injection).
+_FORMULA_LEAD_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 _CSV_BASE_FIELDNAMES = (
     "content_id",
@@ -100,23 +108,65 @@ def pii_type_counts(record: ProvenanceRecord) -> dict[str, int]:
     return counts
 
 
+def sanitize_csv_cell(value: str) -> str:
+    """Neutralize spreadsheet formula injection (OWASP guidance).
+
+    ``user_id``/``app_id`` and other caller-controlled fields can carry
+    ``=HYPERLINK(...)`` or ``=cmd|...`` payloads that execute when the CSV
+    is opened in Excel/Sheets. Prefixing a single apostrophe is the OWASP
+    recommendation: spreadsheet applications strip it on import, so the
+    original text round-trips, and raw-text consumers see an inert string.
+    Tab/CR prefixes are covered too — they are used to smuggle a formula
+    character past naive checks.
+    """
+    if value.startswith(_FORMULA_LEAD_PREFIXES):
+        return "'" + value
+    return value
+
+
+def _record_key_id(record: ProvenanceRecord) -> str:
+    """Read the record's key_id, defaulting before the tamper-evidence fields land."""
+    key_id: str = getattr(record, "key_id", DEFAULT_KEY_ID)
+    return key_id
+
+
 def signature_verdict(
     record: ProvenanceRecord,
     stored_signature: str | None,
     secret_key: str | None,
+    *,
+    keyring: Mapping[str, str] | None = None,
+    active_key_id: str = DEFAULT_KEY_ID,
 ) -> SignatureVerdict:
     """Classify the integrity of a record's stored HMAC signature.
 
     - ``MISSING``: no signature was stored with the record.
-    - ``UNVERIFIED``: a signature exists but no secret key was provided to
-      verify it (exports must not silently imply a check that never ran).
+    - ``UNVERIFIED``: a signature exists but verification could not run —
+      no secret key was provided, or no key is available for the record's
+      ``key_id``. Reporting UNVERIFIED (not INVALID) keeps history signed
+      under a retired key from crying wolf after a rotation.
     - ``VALID`` / ``INVALID``: compared against a freshly computed signature.
+
+    When ``keyring`` (key_id -> secret, including retired keys) is provided
+    it is authoritative: the key is looked up by ``record.key_id``. Without
+    a keyring, records whose ``key_id`` differs from ``active_key_id``
+    cannot be checked against the single active secret and report
+    UNVERIFIED.
     """
     if stored_signature is None:
         return "MISSING"
-    if secret_key is None:
+    record_key_id = _record_key_id(record)
+    if keyring is not None:
+        key = keyring.get(record_key_id)
+        if key is None:
+            return "UNVERIFIED"
+    elif record_key_id != active_key_id:
         return "UNVERIFIED"
-    expected = sign_record(record, secret_key)
+    elif secret_key is None:
+        return "UNVERIFIED"
+    else:
+        key = secret_key
+    expected = sign_record(record, key)
     valid = hmac_lib.compare_digest(stored_signature, expected)
     return "VALID" if valid else "INVALID"
 
@@ -127,12 +177,34 @@ class AuditExporter:
 
     When constructed with a ``secret_key``, exports carry a per-record
     ``signature_verdict`` (VALID/INVALID); without one, records with a
-    stored signature are reported as UNVERIFIED.
+    stored signature are reported as UNVERIFIED. Pass
+    ``verification_keyring`` (key_id -> secret, including retired keys)
+    so history signed under rotated keys verifies correctly.
     """
 
-    def __init__(self, backend: StoreBackend, secret_key: str | None = None) -> None:
+    def __init__(
+        self,
+        backend: StoreBackend,
+        secret_key: str | None = None,
+        *,
+        verification_keyring: Mapping[str, str] | None = None,
+        active_key_id: str = DEFAULT_KEY_ID,
+    ) -> None:
         self._backend = backend
         self._secret_key = secret_key
+        self._verification_keyring = verification_keyring
+        self._active_key_id = active_key_id
+
+    def _verdict(
+        self, record: ProvenanceRecord, signature: str | None
+    ) -> SignatureVerdict:
+        return signature_verdict(
+            record,
+            signature,
+            self._secret_key,
+            keyring=self._verification_keyring,
+            active_key_id=self._active_key_id,
+        )
 
     def query(self, filters: QueryFilters) -> AuditReport:
         return self._backend.query(filters)
@@ -165,9 +237,7 @@ class AuditExporter:
                 yield ExportRecord(
                     record=record,
                     hmac_signature=sig,
-                    signature_verdict=signature_verdict(
-                        record, sig, self._secret_key
-                    ),
+                    signature_verdict=self._verdict(record, sig),
                 )
             fetched += len(page.records)
             offset += len(page.records)
@@ -254,7 +324,7 @@ class AuditExporter:
             yield ExportRecord(
                 record=record,
                 hmac_signature=sig,
-                signature_verdict=signature_verdict(record, sig, self._secret_key),
+                signature_verdict=self._verdict(record, sig),
             )
 
     def _write_json_stream(
@@ -374,7 +444,12 @@ class AuditExporter:
         row["pii_other"] = sum(
             n for name, n in counts.items() if name not in known
         )
-        return row
+        # Formula-injection neutralization on every string cell; numeric
+        # and count values keep their native formatting.
+        return {
+            key: sanitize_csv_cell(value) if isinstance(value, str) else value
+            for key, value in row.items()
+        }
 
     def signed_record_dict(
         self, record: ProvenanceRecord, hmac_signature: str | None
@@ -383,9 +458,7 @@ class AuditExporter:
         exported = ExportRecord(
             record=record,
             hmac_signature=hmac_signature,
-            signature_verdict=signature_verdict(
-                record, hmac_signature, self._secret_key
-            ),
+            signature_verdict=self._verdict(record, hmac_signature),
         )
         return self._signed_record_dict(exported)
 
@@ -415,4 +488,6 @@ class AuditExporter:
             record=record,
             stored_signature=stored_signature,
             secret_key=self._secret_key,
+            keyring=self._verification_keyring,
+            active_key_id=self._active_key_id,
         )

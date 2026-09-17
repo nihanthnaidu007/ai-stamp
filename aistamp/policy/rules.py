@@ -6,6 +6,16 @@ from enum import Enum
 from aistamp.models import PIISeverity, PolicyAction
 
 
+class PolicyError(ValueError):
+    """A policy definition is invalid or unsafe to evaluate.
+
+    Raised by ``from_yaml`` for malformed or rejected policy files —
+    including regular expressions that risk catastrophic backtracking.
+    Subclasses ValueError so 0.1.x callers that catch ValueError for
+    invalid policy files keep working.
+    """
+
+
 class PolicyMode(str, Enum):
     """How the engine combines multiple matching rules.
 

@@ -1,10 +1,12 @@
 from aistamp.audit.evidence import EVIDENCE_VERSION, build_evidence_pack
 from aistamp.audit.exporter import (
+    DEFAULT_KEY_ID,
     AuditExporter,
     ExportRecord,
     SignatureVerdict,
     pii_type_counts,
     record_to_dict,
+    sanitize_csv_cell,
     signature_verdict,
 )
 from aistamp.audit.manifest import (
@@ -17,6 +19,7 @@ from aistamp.audit.retention import enforce_retention
 
 __all__ = [
     "AuditExporter",
+    "DEFAULT_KEY_ID",
     "EVIDENCE_VERSION",
     "ExportManifest",
     "ExportRecord",
@@ -28,5 +31,6 @@ __all__ = [
     "package_version",
     "pii_type_counts",
     "record_to_dict",
+    "sanitize_csv_cell",
     "signature_verdict",
 ]

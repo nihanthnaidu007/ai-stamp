@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+import yaml
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import ArgumentError
 
@@ -242,6 +243,29 @@ def verify(
     raise typer.Exit(code=0 if result.verified else 1)
 
 
+def _load_keyring(path: Path | None) -> dict[str, str] | None:
+    """Load a verification keyring (key_id -> secret) from a YAML file.
+
+    Include retired keys so history signed under rotated keys verifies as
+    VALID instead of UNVERIFIED.
+    """
+    if path is None:
+        return None
+    if not path.exists():
+        typer.echo(f"Keyring file not found: {path}", err=True)
+        raise typer.Exit(code=1)
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in data.items()
+    ):
+        typer.echo(
+            "Keyring file must be a YAML mapping of key ids to secret strings.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    return data
+
+
 @app.command()
 def report(
     from_date: Annotated[
@@ -313,6 +337,14 @@ def report(
             " to this JSON file for reproducibility.",
         ),
     ] = None,
+    keyring: Annotated[
+        Path | None,
+        typer.Option(
+            "--keyring",
+            help="YAML file mapping key ids to signing secrets (include"
+            " retired keys so rotated history verifies).",
+        ),
+    ] = None,
     config_path: Annotated[
         Path | None, typer.Option("--config", help="Path to YAML config file.")
     ] = None,
@@ -320,6 +352,7 @@ def report(
     """Query and export provenance records."""
     config = _load_config(config_path)
     backend = _get_backend(config)
+    verification_keyring = _load_keyring(keyring)
 
     from_dt = None
     to_dt = None
@@ -395,7 +428,11 @@ def report(
         offset=offset,
     )
 
-    exporter = AuditExporter(backend, secret_key=config.secret_key)
+    exporter = AuditExporter(
+        backend,
+        secret_key=config.secret_key,
+        verification_keyring=verification_keyring,
+    )
     audit_report = exporter.query(filters)
 
     if format == "json":
@@ -476,6 +513,14 @@ def evidence(
         Path | None,
         typer.Option("--output", help="Write the evidence pack JSON to this file."),
     ] = None,
+    keyring: Annotated[
+        Path | None,
+        typer.Option(
+            "--keyring",
+            help="YAML file mapping key ids to signing secrets (include"
+            " retired keys so rotated history verifies).",
+        ),
+    ] = None,
     config_path: Annotated[
         Path | None, typer.Option("--config", help="Path to YAML config file.")
     ] = None,
@@ -483,7 +528,11 @@ def evidence(
     """Assemble a verifiable evidence pack for one record (compliance hand-off)."""
     config = _load_config(config_path)
     backend = _get_backend(config)
-    exporter = AuditExporter(backend, secret_key=config.secret_key)
+    exporter = AuditExporter(
+        backend,
+        secret_key=config.secret_key,
+        verification_keyring=_load_keyring(keyring),
+    )
 
     try:
         pack = exporter.evidence_pack(content_id)

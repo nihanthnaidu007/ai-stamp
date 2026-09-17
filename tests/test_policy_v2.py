@@ -8,7 +8,9 @@ import pytest
 
 from aistamp.models import PIISeverity, PolicyAction, ProvenanceRecord
 from aistamp.policy import (
+    MAX_POLICY_REGEX_LENGTH,
     PolicyEngine,
+    PolicyError,
     PolicyMode,
     PolicyViolationError,
     RuleConditions,
@@ -381,4 +383,127 @@ def test_bad_predicate_ref_fails_at_yaml_load(tmp_path: Path) -> None:
         "    action: WARN\n",
     )
     with pytest.raises(ValueError, match="no_such_module_xyz"):
+        PolicyEngine.from_yaml(path)
+
+
+# ---------------------------------------------------------------------------
+# ReDoS: operator model_regex patterns are rejected at load, never evaluate
+# ---------------------------------------------------------------------------
+
+
+_ANCHOR = chr(36)  # the "$" end-anchor, spelled via chr(36) for transport safety
+_REDOS_REGEX = "(a+)+" + _ANCHOR  # the audit's catastrophic PoV pattern
+
+
+def test_from_yaml_rejects_redos_pattern(tmp_path: Path) -> None:
+    # The audit's PoV pattern (a+)+ anchored to end-of-string used to load
+    # fine and hung evaluate() for over five seconds on a 29-character
+    # model string.
+    path = _write_policy(
+        tmp_path,
+        "rules:\n"
+        "  - name: redos\n"
+        "    conditions:\n"
+        f"      model_regex: '{_REDOS_REGEX}'\n"
+        "    action: BLOCK\n",
+    )
+    with pytest.raises(PolicyError, match="backtracking|ReDoS"):
+        PolicyEngine.from_yaml(path)
+
+
+def test_from_yaml_rejects_redos_via_alternation(tmp_path: Path) -> None:
+    # '(a|b+)+' is the same catastrophic shape with the nested quantifier
+    # inside one alternation branch.
+    path = _write_policy(
+        tmp_path,
+        "rules:\n"
+        "  - name: redos\n"
+        "    conditions:\n"
+        "      model_regex: '(a|b+)+'\n"
+        "    action: BLOCK\n",
+    )
+    with pytest.raises(PolicyError, match="backtracking|ReDoS"):
+        PolicyEngine.from_yaml(path)
+
+
+def test_from_yaml_rejects_oversized_regex(tmp_path: Path) -> None:
+    path = _write_policy(
+        tmp_path,
+        "rules:\n"
+        "  - name: long\n"
+        "    conditions:\n"
+        f"      model_regex: '{'a' * (MAX_POLICY_REGEX_LENGTH + 1)}'\n"
+        "    action: BLOCK\n",
+    )
+    with pytest.raises(PolicyError, match="safety limit"):
+        PolicyEngine.from_yaml(path)
+
+
+def test_safe_regexes_still_load_and_match(
+    tmp_path: Path, sample_provenance_record: ProvenanceRecord
+) -> None:
+    # Plain alternation under a quantifier is safe and must keep working.
+    path = _write_policy(
+        tmp_path,
+        "rules:\n"
+        "  - name: model_guard\n"
+        "    conditions:\n"
+        "      model_regex: '(foo|bar)='\n"
+        "    action: WARN\n",
+    )
+    path.write_text(path.read_text().replace("(foo|bar)=", "gpt-4.*"))
+    engine = PolicyEngine.from_yaml(path)
+    hit = sample_provenance_record.model_copy(update={"model": "gpt-4o-mini"})
+    decision = engine.evaluate(hit)
+    assert decision.action is PolicyAction.WARN
+    assert decision.matched_conditions.get("model_regex") == "gpt-4o-mini"
+    miss = sample_provenance_record.model_copy(update={"model": "claude-3"})
+    assert engine.evaluate(miss).matched_conditions.get("model_regex") is None
+
+
+def test_redos_pov_never_reaches_evaluate(tmp_path: Path) -> None:
+    # The audit PoV input: pattern accepted at load, then evaluate() hung
+    # on model="a"*28+"!". Load must raise before any evaluation is possible.
+    path = _write_policy(
+        tmp_path,
+        "rules:\n"
+        "  - name: redos\n"
+        "    conditions:\n"
+        f"      model_regex: '{_REDOS_REGEX}'\n"
+        "    action: BLOCK\n",
+    )
+    with pytest.raises(PolicyError):
+        PolicyEngine.from_yaml(path)  # never returns an engine to evaluate with
+
+
+def test_evaluate_rejects_redos_on_direct_conditions(
+    sample_provenance_record: ProvenanceRecord,
+) -> None:
+    # Defense in depth: conditions constructed directly in code bypass
+    # from_yaml, so evaluate() itself must route through the safety check.
+    engine = _engine(
+        RuleConfig(
+            name="direct_redos",
+            conditions=RuleConditions(model_regex="(a+)+$"),
+            action=PolicyAction.WARN,
+        )
+    )
+    record = sample_provenance_record.model_copy(
+        update={"model": "a" * 28 + "!"}
+    )
+    with pytest.raises(PolicyError, match="backtracking|ReDoS"):
+        engine.evaluate(record)
+
+
+def test_policy_error_is_value_error_for_0_1_x_callers(tmp_path: Path) -> None:
+    path = _write_policy(
+        tmp_path,
+        "rules:\n"
+        "  - name: r\n"
+        "    conditions:\n"
+        "      model_regex: '(a+)+'\n"
+        "    action: WARN\n",
+    )
+    # 0.1.x callers catch ValueError for invalid policies.
+    with pytest.raises(ValueError):
         PolicyEngine.from_yaml(path)

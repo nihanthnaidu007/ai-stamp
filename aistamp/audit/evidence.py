@@ -8,10 +8,12 @@ trace that explains why the system allowed, warned, or blocked it.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
 from aistamp.audit.exporter import (
+    DEFAULT_KEY_ID,
     SignatureVerdict,
     pii_type_counts,
     record_to_dict,
@@ -26,15 +28,24 @@ def build_evidence_pack(
     record: ProvenanceRecord,
     stored_signature: str | None,
     secret_key: str | None,
+    *,
+    keyring: Mapping[str, str] | None = None,
+    active_key_id: str = DEFAULT_KEY_ID,
 ) -> dict[str, Any]:
     """Assemble a JSON-ready evidence pack for one provenance record.
 
     ``signature_verdict`` is computed from the record as read back from the
     store, so an exported pack proves both what was stored and that the
-    stored signature does (or does not) verify against the current secret.
+    stored signature does (or does not) verify. Pass ``keyring``
+    (key_id -> secret, including retired keys) so history signed under
+    rotated keys verifies as VALID instead of UNVERIFIED.
     """
     verdict: SignatureVerdict = signature_verdict(
-        record, stored_signature, secret_key
+        record,
+        stored_signature,
+        secret_key,
+        keyring=keyring,
+        active_key_id=active_key_id,
     )
 
     policy_trace: dict[str, Any] | None = None
@@ -56,7 +67,9 @@ def build_evidence_pack(
         "record": record_to_dict(record),
         "hmac_signature": stored_signature,
         "verification": {
-            "algorithm": "HMAC-SHA256",
+            # The record's declared algorithm, not a hardcoded one — the
+            # tamper-evidence track may introduce additional sig_algo values.
+            "algorithm": str(getattr(record, "sig_algo", "HMAC-SHA256")),
             "signature_verdict": verdict,
         },
         "pii_detail": {

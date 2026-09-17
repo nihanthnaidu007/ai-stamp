@@ -18,7 +18,13 @@ from aistamp.models import (
     PolicyDecision,
     ProvenanceRecord,
 )
-from aistamp.policy.rules import PolicyMode, RuleConditions, RuleConfig
+from aistamp.policy.regex_safety import compiled_safe_regex, ensure_safe_regex
+from aistamp.policy.rules import (
+    PolicyError,
+    PolicyMode,
+    RuleConditions,
+    RuleConfig,
+)
 
 logger = logging.getLogger("aistamp.policy")
 
@@ -212,7 +218,11 @@ def _conditions_match(
         matched["pii_types"] = intersection
 
     if conditions.model_regex is not None:
-        if re.fullmatch(conditions.model_regex, record.model) is None:
+        # Defense in depth: also guards conditions constructed directly in
+        # code, and compiles once per pattern instead of per call.
+        if compiled_safe_regex(conditions.model_regex).fullmatch(
+            record.model
+        ) is None:
             return False, {}
         matched["model_regex"] = record.model
 
@@ -497,6 +507,15 @@ class PolicyEngine:
             except re.error as e:
                 raise ValueError(
                     f"Rule {name!r} condition 'model_regex' has invalid regex: {e}"
+                ) from e
+            # Load-time ReDoS guard: an unsafe pattern must be rejected here
+            # so it can never reach evaluate(), where it runs against
+            # attacker-influenced model strings.
+            try:
+                ensure_safe_regex(model_regex)
+            except PolicyError as e:
+                raise PolicyError(
+                    f"Rule {name!r} condition 'model_regex' is unsafe: {e}"
                 ) from e
 
         predicate: str | None = None
