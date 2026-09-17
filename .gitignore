@@ -60,3 +60,4 @@ PKG-INFO
 .DS_Store
 .AppleDouble
 .LSOverride
+coverage.xml
