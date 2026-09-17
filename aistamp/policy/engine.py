@@ -6,6 +6,7 @@ from typing import Any
 
 import yaml
 
+from aistamp.errors import AIStampError
 from aistamp.models import (
     SEVERITY_RANK,
     PIISeverity,
@@ -22,9 +23,14 @@ _VALID_ACTIONS = {"ALLOW", "WARN", "BLOCK"}
 _VALID_SEVERITIES = {"LOW", "MEDIUM", "HIGH"}
 
 
-class PolicyViolationError(Exception):
+class PolicyViolationError(AIStampError):
     """
     Raised by PolicyEngine.evaluate() when a rule with action=BLOCK is matched.
+
+    Since 0.2 this derives from :class:`aistamp.errors.AIStampError` so
+    ``except AIStampError`` also catches policy blocks. The old import paths
+    (``aistamp.policy.PolicyViolationError``, ``aistamp.PolicyViolationError``)
+    keep working.
 
     Attributes:
         rule_name:  name of the rule that triggered the block.
@@ -40,7 +46,8 @@ class PolicyViolationError(Exception):
     ) -> None:
         super().__init__(
             f"Policy rule {rule_name!r} blocked content_id={content_id!r}. "
-            f"Reason: {decision.reason}"
+            f"Reason: {decision.reason}",
+            content_id=content_id,
         )
         self.rule_name = rule_name
         self.decision = decision

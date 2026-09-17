@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 import aistamp
 from aistamp.config import Config
+from aistamp.errors import ConfigError
 from aistamp.models import (
     AuditReport,
     PIIMatch,
@@ -33,7 +34,9 @@ def test_config_from_env_loads_correctly(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.delenv("AISTAMP_DATABASE_URL", raising=False)
     monkeypatch.delenv("AISTAMP_LOG_LEVEL", raising=False)
     config = Config.from_env()
-    assert config.secret_key == "a" * 32
+    # v0.2: secret_key is a SecretStr; secret_key_value exposes the plaintext.
+    assert config.secret_key_value == "a" * 32
+    assert "a" * 32 not in repr(config.secret_key)
     assert config.database_url == "sqlite:///./aistamp.db"
     assert config.log_level == "INFO"
 
@@ -41,9 +44,10 @@ def test_config_from_env_loads_correctly(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_config_from_env_raises_on_missing_secret_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # from_env() must raise KeyError when AISTAMP_SECRET_KEY is not set.
+    # v0.2: from_env() raises a friendly ConfigError (not a bare KeyError)
+    # when AISTAMP_SECRET_KEY is not set.
     monkeypatch.delenv("AISTAMP_SECRET_KEY", raising=False)
-    with pytest.raises(KeyError):
+    with pytest.raises(ConfigError):
         Config.from_env()
 
 
@@ -59,7 +63,7 @@ def test_config_from_yaml_loads_correctly(tmp_path) -> None:
     )
     yaml_path.write_text(yaml_content)
     config = Config.from_yaml(yaml_path)
-    assert config.secret_key == "b" * 32
+    assert config.secret_key_value == "b" * 32
     assert config.database_url == "sqlite:///:memory:"
     assert config.log_level == "WARNING"
 

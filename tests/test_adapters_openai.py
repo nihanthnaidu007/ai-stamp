@@ -304,12 +304,9 @@ async def test_adapter_rejects_unsupported_client_type(
     use_async: bool,
 ) -> None:
     # No fake module needed: object() matches no adapter branch.
+    # v0.2 validates the wrapped client at construction time, before any
+    # provider call can be attributed provenance.
     config = _make_config()
     backend = _make_backend(config)
-    client = _rejection_client(use_async, config, backend)
-
-    with pytest.raises(StampError, match="Unsupported LLM client type: object"):
-        if isinstance(client, AsyncProvenanceClient):
-            await client.chat("hi")
-        else:
-            client.chat("hi")
+    with pytest.raises(TypeError, match="Unsupported LLM client type: object"):
+        _rejection_client(use_async, config, backend)

@@ -16,8 +16,9 @@ from urllib.error import HTTPError
 
 import pytest
 
-from aistamp.client import GenericHTTPClient, ProvenanceClient, StampError
+from aistamp.client import GenericHTTPClient, ProvenanceClient
 from aistamp.config import Config
+from aistamp.errors import ProviderResponseError
 from aistamp.models import QueryFilters, RecordStatus
 from aistamp.store import SQLiteBackend
 
@@ -159,8 +160,11 @@ def test_server_error_raises_http_error(llm_server_factory: Any) -> None:
     server = llm_server_factory(status=500, payload={"error": "kaboom"})
     client = GenericHTTPClient(endpoint=server.endpoint)
 
-    with pytest.raises(HTTPError):
+    # v0.2: raw HTTPError is wrapped into the taxonomy (retryable); the
+    # original error stays chained for diagnostics.
+    with pytest.raises(ProviderResponseError, match="HTTP 500") as excinfo:
         client.complete("p", "m")
+    assert isinstance(excinfo.value.__cause__, HTTPError)
 
 
 # --- Client-level integration over the real HTTP path ------------------------
@@ -208,7 +212,7 @@ def test_provenance_client_http_error_persists_error_record(
         backend=backend,
     )
 
-    with pytest.raises(StampError, match="LLM call failed"):
+    with pytest.raises(ProviderResponseError, match="HTTP 500"):
         client.chat("hello http", model="test-model")
 
     report = backend.query(QueryFilters())

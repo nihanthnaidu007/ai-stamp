@@ -6,6 +6,8 @@ import json
 import uuid
 from datetime import timezone
 
+from pydantic import SecretStr
+
 from aistamp.models import ProvenanceRecord, VerificationResult
 from aistamp.store.backend import StoreBackend
 
@@ -40,17 +42,25 @@ def _canonical_bytes(record: ProvenanceRecord) -> bytes:
     return canonical.encode("utf-8")
 
 
-def sign_record(record: ProvenanceRecord, secret_key: str) -> str:
-    key_bytes = secret_key.encode("utf-8")
+def sign_record(record: ProvenanceRecord, secret_key: str | SecretStr) -> str:
+    key_bytes = _key_bytes(secret_key)
     msg_bytes = _canonical_bytes(record)
     return hmac_lib.new(key_bytes, msg_bytes, hashlib.sha256).hexdigest()
+
+
+def _key_bytes(secret_key: str | SecretStr) -> bytes:
+    # Config.secret_key became SecretStr in v0.2; accepting either keeps the
+    # signing bytes identical for plain-string callers.
+    if isinstance(secret_key, SecretStr):
+        return secret_key.get_secret_value().encode("utf-8")
+    return secret_key.encode("utf-8")
 
 
 def verify_record(
     content_id: str,
     current_text: str,
     backend: StoreBackend,
-    secret_key: str,
+    secret_key: str | SecretStr,
 ) -> VerificationResult:
     result = backend.get(content_id)
     if result is None:
