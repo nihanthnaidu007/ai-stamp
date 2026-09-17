@@ -166,6 +166,12 @@ def test_postgres_pinned_columns_jsonb_and_gin() -> None:
                     )
                 ).all()
             )
+        # pg_get_indexdef double-quotes reserved-word columns on some
+        # Postgres versions (e.g. btree (app_id, "timestamp")) — compare
+        # quote-stripped definitions so both renderings assert equal.
+        index_defs = {
+            name: definition.replace('"', "") for name, definition in index_defs.items()
+        }
         assert "USING gin" in index_defs["ix_provenance_records_pii_result_gin"]
         assert "ix_provenance_records_policy_decision_gin" in index_defs
         assert "ix_provenance_records_app_id_timestamp" in index_defs
@@ -263,10 +269,17 @@ def test_postgres_purge_and_write_ahead() -> None:
 def test_postgres_migration_up_down(monkeypatch: pytest.MonkeyPatch) -> None:
     """Migration 0002 up/down against a throwaway PostgreSQL database."""
     monkeypatch.delenv("AISTAMP_DATABASE_URL", raising=False)
+    # Derive every URL from AISTAMP_TEST_POSTGRES_URL, swapping ONLY the
+    # database name for the throwaway — and NEVER via str(URL): SQLAlchemy
+    # masks the password as a literal *** in rendered strings (CI failure
+    # 2026-09-17: the server received "***" as the password and every
+    # connection failed with FATAL: password authentication failed for
+    # user "postgres"). render_as_string(hide_password=False) keeps the
+    # real credentials; the other passing PG tests use the env URL as-is.
     base_url = make_url(POSTGRES_URL)
     db_name = f"aistamp_mig_{uuid.uuid4().hex[:10]}"
-    admin_url = str(base_url.set(database="postgres"))
-    mig_url = str(base_url.set(database=db_name))
+    admin_url = POSTGRES_URL
+    mig_url = base_url.set(database=db_name).render_as_string(hide_password=False)
 
     admin_engine = create_engine(admin_url, isolation_level="AUTOCOMMIT")
     with admin_engine.connect() as conn:
