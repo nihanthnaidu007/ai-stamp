@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class PIISeverity(str, Enum):
@@ -92,6 +92,12 @@ class PolicyDecision(_FrozenModel):
     action: PolicyAction
     rule_name: str | None
     reason: str | None
+    # Decision transparency (v0.2): the concrete record-side values that fired,
+    # the trace of rules that matched during evaluation, and when the decision
+    # was made. Defaults keep 0.1.x constructors and persisted JSON valid.
+    matched_conditions: dict[str, Any] = Field(default_factory=dict)
+    evaluated_rules: list[str] = Field(default_factory=list)
+    decided_at: datetime | None = None
 
 
 class ProvenanceRecord(_FrozenModel):
