@@ -1,1 +1,6 @@
-include tests/conftest.py
+# Files shipped in the sdist beyond setuptools' automatic set (README, LICENSE,
+# package source, and [tool.setuptools.package-data] files).
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SECURITY.md
+graft examples

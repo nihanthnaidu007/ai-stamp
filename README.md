@@ -131,8 +131,10 @@ The endpoint receives JSON with `prompt` and `model`. It must return `text` or
 ```python
 from aistamp import AsyncProvenanceClient, AsyncSQLiteBackend, Config
 
+
 async def generate(prompt: str) -> str:
     return f"Generated answer for: {prompt}"
+
 
 backend = AsyncSQLiteBackend("sqlite+aiosqlite:///./aistamp.db")
 await backend.create_tables()
@@ -326,12 +328,46 @@ pytest tests/test_store_postgres.py -rs
 
 The PostgreSQL extra installs `psycopg2-binary` and `asyncpg`.
 
+## Examples
+
+Runnable quickstarts live in [`examples/`](examples/) — each is a
+self-contained script against the current API:
+
+| Example | Shows |
+|---|---|
+| [`quickstart_callable.py`](examples/quickstart_callable.py) | Wrapping any callable LLM provider |
+| [`openai_stamp.py`](examples/openai_stamp.py) | Wrapping the real OpenAI SDK |
+| [`policy_block.py`](examples/policy_block.py) | Blocking a risky call with policy rules |
+| [`audit_export.py`](examples/audit_export.py) | Exporting the audit trail as JSON/CSV |
+| [`verify_record.py`](examples/verify_record.py) | Detecting tampering with `verify_record` |
+
+```bash
+python examples/quickstart_callable.py
+```
+
 ## Status
 
-`ai-stamp` is currently marked Alpha. It is intended for developers who need a
-small provenance and audit layer around AI-generated content. Review privacy,
+`ai-stamp` is currently marked **Beta**: the public API is stable, the test
+suite runs on CI across Python 3.10–3.13 (including live PostgreSQL
+integration tests), and the packaging pipeline is automated. Review privacy,
 security, retention, and compliance requirements before using it in regulated
 production workflows.
+
+### Trust and verification roadmap (upcoming in 0.2)
+
+The current release signs every record with a single HMAC secret and verifies
+on demand. Hardening work planned for the 0.2 line — **not yet merged**:
+
+- **Key rotation** — versioned signatures with key IDs so verification can
+  span multiple signing keys and a rotation event.
+- **Retention** — configurable record lifecycle (TTL, purge, evidence
+  export) for data-minimizing deployments.
+- **Re-verification** — bulk re-verification of historical records against
+  current keys and content, with tamper-evidence envelopes and optional
+  hash chaining.
+
+Until those land, treat the stored HMAC as an integrity check with a
+single-key lifecycle, and plan key handling accordingly.
 
 ## License
 
