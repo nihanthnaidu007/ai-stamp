@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from types import TracebackType
-from typing import Sequence
+from typing import Any, cast
 
-from sqlalchemy import delete, select
+from sqlalchemy import CursorResult, delete, select
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -82,9 +83,7 @@ class AsyncStoreBackend(ABC):
         ...
 
     @abstractmethod
-    async def purge(
-        self, retention_days: int, *, now: datetime | None = None
-    ) -> int:
+    async def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
         """Delete records older than retention_days. Returns the deleted count."""
         ...
 
@@ -201,7 +200,8 @@ class _AsyncSQLAlchemyBackend(AsyncStoreBackend):
                 )
             )
             await session.commit()
-            return int(result.rowcount or 0)
+            # DML executes return CursorResult at runtime; rowcount lives there.
+            return int(cast("CursorResult[Any]", result).rowcount or 0)
 
     async def close(self) -> None:
         await self._engine.dispose()

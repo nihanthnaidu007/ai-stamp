@@ -10,25 +10,24 @@ Revision ID: 0002
 Revises: 0001
 """
 
-from typing import Sequence, Union
+from collections.abc import Sequence
+from typing import Any
 
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0002"
-down_revision: Union[str, None] = "0001"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | None = "0001"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 _TABLE = "provenance_records"
 
 # Pinned shared columns — the full field list other v0.2.0 tracks build on.
-_NEW_COLUMNS = [
+_NEW_COLUMNS: list[sa.Column[Any]] = [
     sa.Column("key_id", sa.String(64), nullable=False, server_default="default"),
-    sa.Column(
-        "sig_algo", sa.String(32), nullable=False, server_default="HMAC-SHA256"
-    ),
+    sa.Column("sig_algo", sa.String(32), nullable=False, server_default="HMAC-SHA256"),
     sa.Column("record_version", sa.Integer(), nullable=False, server_default="1"),
     sa.Column("prev_hash", sa.String(64), nullable=True),
     sa.Column("scope_sequence", sa.Integer(), nullable=True),
@@ -67,9 +66,7 @@ def upgrade() -> None:
                 postgresql_using=f"{json_column}::jsonb",
             )
         for json_column, index_name in _JSON_GIN_INDEXES.items():
-            op.create_index(
-                index_name, _TABLE, [json_column], postgresql_using="gin"
-            )
+            op.create_index(index_name, _TABLE, [json_column], postgresql_using="gin")
 
 
 def downgrade() -> None:

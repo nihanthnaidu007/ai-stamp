@@ -36,7 +36,9 @@ class ProvenanceRecordORM(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, index=True)
     pii_result: Mapped[dict[str, Any] | None] = mapped_column(JSONType, nullable=True)
-    policy_decision: Mapped[dict[str, Any] | None] = mapped_column(JSONType, nullable=True)
+    policy_decision: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONType, nullable=True
+    )
     # --- Pinned v0.2.0 columns (migration 0002) ---
     key_id: Mapped[str] = mapped_column(
         String(64), nullable=False, default="default", server_default="default"

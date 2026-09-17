@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
-from typing import Any, Sequence
+from typing import Any, cast
 
 from sqlalchemy import (
+    ColumnElement,
+    CursorResult,
     Engine,
     Select,
     and_,
@@ -15,7 +18,6 @@ from sqlalchemy import (
     or_,
     select,
 )
-from sqlalchemy import ColumnElement
 from sqlalchemy.orm import Session
 
 from aistamp.models import (
@@ -77,16 +79,12 @@ class StoreBackend(ABC):
         ...
 
     @abstractmethod
-    def write_many(
-        self, items: Sequence[tuple[ProvenanceRecord, str | None]]
-    ) -> None:
+    def write_many(self, items: Sequence[tuple[ProvenanceRecord, str | None]]) -> None:
         """Persist a batch of (record, hmac_signature) pairs in one transaction."""
         ...
 
     @abstractmethod
-    def purge(
-        self, retention_days: int, *, now: datetime | None = None
-    ) -> int:
+    def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
         """Delete records older than retention_days. Returns the deleted count."""
         ...
 
@@ -386,16 +384,12 @@ class _SyncSQLAlchemyBackend(StoreBackend):
                 _apply_record_to_orm(row, record, hmac_signature)
             session.commit()
 
-    def write_many(
-        self, items: Sequence[tuple[ProvenanceRecord, str | None]]
-    ) -> None:
+    def write_many(self, items: Sequence[tuple[ProvenanceRecord, str | None]]) -> None:
         pairs = list(items)
         if not pairs:
             return
         with Session(self._engine) as session:
-            session.add_all(
-                [_record_to_orm(record, hmac) for record, hmac in pairs]
-            )
+            session.add_all([_record_to_orm(record, hmac) for record, hmac in pairs])
             session.commit()
 
     def get(self, content_id: str) -> tuple[ProvenanceRecord, str | None] | None:
@@ -432,7 +426,8 @@ class _SyncSQLAlchemyBackend(StoreBackend):
                 )
             )
             session.commit()
-            return int(result.rowcount or 0)
+            # DML executes return CursorResult at runtime; rowcount lives there.
+            return int(cast("CursorResult[Any]", result).rowcount or 0)
 
     def close(self) -> None:
         self._engine.dispose()
