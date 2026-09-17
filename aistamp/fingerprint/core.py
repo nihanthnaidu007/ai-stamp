@@ -546,7 +546,13 @@ def verify_chain(
                             )
                         )
                 expected_prev = record_hash(prev_record)
-                if rec.prev_hash != expected_prev and not gap_anchored:
+                # Constant-time comparison (audit hardening): a chain link
+                # names attacker-influenced content, so equality against the
+                # recomputed hash must not leak match progress by timing.
+                links_match = rec.prev_hash is not None and hmac_lib.compare_digest(
+                    rec.prev_hash, expected_prev
+                )
+                if not links_match and not gap_anchored:
                     # When the gap is anchored, the true predecessor was
                     # purged and the survivor's pointer names purged content
                     # whose hash is unrecoverable — the mismatch is expected.

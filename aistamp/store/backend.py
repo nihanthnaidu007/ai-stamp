@@ -178,6 +178,39 @@ def _orm_to_model(row: ProvenanceRecordORM) -> ProvenanceRecord:
     )
 
 
+def finalize_overwrite_allowed(
+    row: ProvenanceRecordORM | None,
+    record: ProvenanceRecord,
+    hmac_signature: str | None,
+) -> bool:
+    """Decide whether finalize() may write over a stored row (audit P2-10).
+
+    finalize() is the write-ahead lifecycle endpoint: a PENDING record is
+    persisted before the provider call and finalized with the outcome, so
+    any non-COMPLETED stored row may be overwritten. A stored COMPLETED
+    record is history — finalizing it again is only allowed as an
+    identical replay (idempotent retry), which returns False (no-op);
+    anything else raises ValueError instead of silently rewriting the
+    audit trail.
+    """
+    if row is None or row.status != RecordStatus.COMPLETED.value:
+        return True
+    # hmac_signature=None means "keep the stored signature" (finalize
+    # contract), so an identical replay under None is still a no-op.
+    effective_sig = (
+        hmac_signature if hmac_signature is not None else row.hmac_signature
+    )
+    if _orm_to_model(row) == record and (
+        (effective_sig or None) == (row.hmac_signature or None)
+    ):
+        return False
+    raise ValueError(
+        f"finalize() would overwrite COMPLETED record {record.content_id!r}: "
+        "final records are immutable history (audit P2-10). "
+        "Write a new record instead."
+    )
+
+
 def _apply_record_to_orm(
     target: ProvenanceRecordORM,
     record: ProvenanceRecord,
@@ -439,10 +472,11 @@ class _SyncSQLAlchemyBackend(StoreBackend):
                 .with_for_update()
             )
             row = session.execute(stmt).scalar_one_or_none()
-            if row is None:
-                session.add(_record_to_orm(record, hmac_signature))
-            else:
-                _apply_record_to_orm(row, record, hmac_signature)
+            if finalize_overwrite_allowed(row, record, hmac_signature):
+                if row is None:
+                    session.add(_record_to_orm(record, hmac_signature))
+                else:
+                    _apply_record_to_orm(row, record, hmac_signature)
             session.commit()
 
     def write_many(self, items: Sequence[tuple[ProvenanceRecord, str | None]]) -> None:

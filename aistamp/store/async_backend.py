@@ -29,6 +29,7 @@ from aistamp.store.backend import (
     _register_sqlite_pragmas,
     _retention_cutoff,
     _to_naive_utc,
+    finalize_overwrite_allowed,
 )
 from aistamp.store.schema import Base, ProvenanceRecordORM, PurgeAnchorORM
 
@@ -151,10 +152,11 @@ class _AsyncSQLAlchemyBackend(AsyncStoreBackend):
             )
             result = await session.execute(stmt)
             row = result.scalar_one_or_none()
-            if row is None:
-                session.add(_record_to_orm(record, hmac_signature))
-            else:
-                _apply_record_to_orm(row, record, hmac_signature)
+            if finalize_overwrite_allowed(row, record, hmac_signature):
+                if row is None:
+                    session.add(_record_to_orm(record, hmac_signature))
+                else:
+                    _apply_record_to_orm(row, record, hmac_signature)
             await session.commit()
 
     async def write_many(

@@ -37,6 +37,8 @@ from aistamp.pii.locales import get_locale_patterns
 from aistamp.pii.ner import NERConfig, scan_with_ner
 from aistamp.pii.patterns import BUILT_IN_PATTERNS, PatternConfig
 from aistamp.pii.validators import VALIDATOR_REJECTED_CONFIDENCE, VALIDATORS
+from aistamp.policy.regex_safety import ensure_safe_regex
+from aistamp.policy.rules import PolicyError
 
 logger = logging.getLogger("aistamp.pii")
 
@@ -44,8 +46,25 @@ _REGEX_ALLOWLIST_PREFIX = "regex:"
 
 
 @lru_cache(maxsize=512)
-def _compile_pattern(config: PatternConfig) -> re.Pattern[str]:
-    """Compile a pattern once per config, including caller-supplied ones."""
+def _compile_pattern(
+    config: PatternConfig, *, trusted: bool = False
+) -> re.Pattern[str]:
+    """Compile a pattern once per config, including caller-supplied ones.
+
+    Untrusted patterns (operator-supplied ``extra_patterns``, which also
+    carry YAML customs) route through the policy layer's regex safety
+    analysis (audit P1-2 defense in depth): a nested-quantifier operator
+    pattern can never reach evaluation. Built-in and locale packs are
+    code-reviewed and skip the analysis — its conservative heuristic
+    rejects several of them for bounded group repetition. PolicyError is
+    re-raised as ValueError to match scan_text's documented
+    configuration-error contract.
+    """
+    if not trusted:
+        try:
+            ensure_safe_regex(config.pattern)
+        except PolicyError as exc:
+            raise ValueError(str(exc)) from exc
     return re.compile(config.pattern)
 
 
@@ -65,9 +84,8 @@ def _is_allowlisted(value: str, entries: Sequence[str]) -> bool:
             return True
     return False
 
-def _reject_shadowed_names(
-    extras: Sequence[PatternConfig], reserved: set[str]
-) -> None:
+
+def _reject_shadowed_names(extras: Sequence[PatternConfig], reserved: set[str]) -> None:
     """Reject extras that reuse a reserved pattern name.
 
     A shadowing extra silently races the original during arbitration and
@@ -187,13 +205,15 @@ def scan_text(
     configs: list[PatternConfig] = list(BUILT_IN_PATTERNS)
     if locale is not None:
         configs.extend(get_locale_patterns(locale))
-    if extra_patterns:
-        _reject_shadowed_names(extra_patterns, reserved={c.name for c in configs})
-        configs.extend(extra_patterns)
+    user_patterns = list(extra_patterns or [])
+    user_set = set(user_patterns)
+    if user_patterns:
+        _reject_shadowed_names(user_patterns, reserved={c.name for c in configs})
+        configs.extend(user_patterns)
 
     matches: list[PIIMatch] = []
     for config in configs:
-        compiled = _compile_pattern(config)
+        compiled = _compile_pattern(config, trusted=config not in user_set)
         for found in compiled.finditer(text):
             value = found.group()
             if config.allowlist and _is_allowlisted(value, config.allowlist):

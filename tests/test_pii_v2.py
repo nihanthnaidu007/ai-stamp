@@ -1046,3 +1046,20 @@ def test_pii_result_with_confidence_survives_roundtrip() -> None:
     restored = PIIResult.model_validate(dumped)
     assert restored.prompt_matches[0].confidence == 1.0
     assert restored.match_count == result.match_count
+
+
+def test_extra_patterns_route_through_regex_safety() -> None:
+    # P1-2 defense in depth: user-supplied extra patterns face the policy
+    # layer's regex safety analysis before they can reach evaluation, so a
+    # nested-quantifier operator pattern is refused at scan_text, not run
+    # against attacker-influenced text.
+    evil = PatternConfig(name="evil", pattern="(a+)+$", severity=PIISeverity.HIGH)
+    with pytest.raises(ValueError, match="nests quantifiers"):
+        scan_text("a" * 40, extra_patterns=[evil])
+
+
+def test_extra_patterns_safe_user_pattern_still_works() -> None:
+    # Positive control: a benign user pattern compiles and matches.
+    safe = PatternConfig(name="acct", pattern=r"ACCT-\d{6}", severity=PIISeverity.LOW)
+    matches = scan_text("order ACCT-123456 paid", extra_patterns=[safe])
+    assert any(m.pattern_name == "acct" for m in matches)
