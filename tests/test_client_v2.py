@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import sys
 import types
+import uuid
 from collections.abc import AsyncIterator, Iterator
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
+from urllib.error import HTTPError, URLError
 
 import pytest
 from pydantic import ValidationError
 
+import aistamp.client._pipeline as pipeline_module
 import aistamp.pii
 from aistamp.client import (
     AsyncProvenanceClient,
@@ -23,9 +27,20 @@ from aistamp.client import (
     StampResult,
     TokenUsage,
 )
+from aistamp.client import http as http_module
+from aistamp.client._pipeline import (
+    CaptureContext,
+    apply_pre_call_policy,
+    classify_provider_error,
+    report_persist_failure,
+    report_persist_failure_async,
+    try_persist_async,
+    try_persist_sync,
+)
 from aistamp.client._retry import compute_delay
-from aistamp.client.http import GenericHTTPClient
-from aistamp.config import Config
+from aistamp.client.async_ import _build_default_async_backend
+from aistamp.client.http import GenericHTTPClient, wrap_http_error
+from aistamp.config import Config, interpolate_env_vars
 from aistamp.errors import (
     AIStampError,
     ConfigError,
@@ -36,8 +51,16 @@ from aistamp.errors import (
     StampError,
 )
 from aistamp.fingerprint import hash_content
-from aistamp.models import QueryFilters
+from aistamp.models import (
+    PIIResult,
+    PolicyAction,
+    ProvenanceRecord,
+    QueryFilters,
+)
+from aistamp.policy.engine import PolicyEngine, PolicyViolationError
+from aistamp.policy.rules import RuleConditions, RuleConfig
 from aistamp.store import SQLiteBackend
+from aistamp.store.async_backend import AsyncPostgreSQLBackend
 
 _SECRET = "v2-test-secret-key-minimum-32-chars!"
 
@@ -136,6 +159,40 @@ class _FakeAsyncOpenAI:
             yield chunk
 
 
+class _DualIterable:
+    """Sync- and async-iterable string sequence.
+
+    Mirrors the real Anthropic SDK, where ``text_stream`` is sync-iterable
+    on ``MessageStream`` and async-iterable on ``AsyncMessageStream``.
+    """
+
+    def __init__(self, texts: list[str]) -> None:
+        self._texts = texts
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._texts)
+
+    def __aiter__(self) -> AsyncIterator[str]:
+        async def _gen() -> AsyncIterator[str]:
+            for text in self._texts:
+                yield text
+
+        return _gen()
+
+
+class _AwaitableFinalMessage:
+    """Final-message stand-in that works awaited (async SDK) and plain (sync)."""
+
+    def __init__(self, usage: Any) -> None:
+        self.usage = usage
+
+    def __await__(self) -> Any:
+        async def _coro() -> _AwaitableFinalMessage:
+            return self
+
+        return _coro().__await__()
+
+
 class _FakeAnthropicStream:
     def __init__(self, texts: list[str], final_usage: Any) -> None:
         self._texts = texts
@@ -154,22 +211,11 @@ class _FakeAnthropicStream:
         return False
 
     @property
-    def text_stream(self) -> Iterator[str]:
-        return iter(self._texts)
+    def text_stream(self) -> _DualIterable:
+        return _DualIterable(self._texts)
 
-    @property
-    def text_stream_async(self) -> AsyncIterator[str]:
-        async def _gen() -> AsyncIterator[str]:
-            for text in self._texts:
-                yield text
-
-        return _gen()
-
-    def get_final_message(self) -> Any:
-        return SimpleNamespace(usage=self._final_usage)
-
-    async def get_final_message_async(self) -> Any:
-        return self.get_final_message()
+    def get_final_message(self) -> _AwaitableFinalMessage:
+        return _AwaitableFinalMessage(self._final_usage)
 
 
 class _FakeAnthropic:
@@ -1009,3 +1055,553 @@ async def test_async_stream_stamps_concatenation(
     assert result.usage == TokenUsage(prompt_tokens=5, response_tokens=3)
     report = backend.query(QueryFilters(user_id="user"))
     assert report.total_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Coverage: config hardening edge paths
+# ---------------------------------------------------------------------------
+
+
+def test_config_env_interpolation_missing_var_raises(tmp_path: Any) -> None:
+    path = tmp_path / "cfg.yaml"
+    path.write_text(
+        f"secret_key: {_SECRET}\n"
+        "database_url: sqlite:///./x.db\n"
+        "log_level: ${AISTAMP_TEST_MISSING_ENV}\n"
+    )
+    with pytest.raises(ConfigError, match="AISTAMP_TEST_MISSING_ENV"):
+        Config.from_yaml(path)
+
+
+def test_interpolate_env_vars_lists_and_dicts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AISTAMP_TEST_V", "v")
+    out = interpolate_env_vars(
+        ["${AISTAMP_TEST_V}", {"k": "${AISTAMP_TEST_V}", "n": 1}]
+    )
+    assert out == ["v", {"k": "v", "n": 1}]
+
+
+def test_config_rejects_database_url_without_scheme() -> None:
+    with pytest.raises(ValidationError, match="scheme"):
+        Config(secret_key=_SECRET, database_url="aistamp.db")
+
+
+def test_config_from_env_optional_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AISTAMP_SECRET_KEY", _SECRET)
+    monkeypatch.setenv("AISTAMP_DATABASE_URL", "sqlite:///./env.db")
+    monkeypatch.setenv("AISTAMP_LOG_LEVEL", "debug")
+    monkeypatch.setenv("AISTAMP_KEY_ID", "k-1")
+    monkeypatch.setenv("AISTAMP_REDACT_BEFORE_SEND", "true")
+    cfg = Config.from_env()
+    assert cfg.database_url == "sqlite:///./env.db"
+    assert cfg.log_level == "DEBUG"
+    assert cfg.key_id == "k-1"
+    assert cfg.redact_before_send is True
+
+
+def test_config_from_yaml_rejects_non_mapping(tmp_path: Any) -> None:
+    path = tmp_path / "cfg.yaml"
+    path.write_text("- one\n- two\n")
+    with pytest.raises(ConfigError, match="YAML mapping"):
+        Config.from_yaml(path)
+
+
+def test_config_from_yaml_requires_secret_key(tmp_path: Any) -> None:
+    path = tmp_path / "cfg.yaml"
+    path.write_text("database_url: sqlite:///./x.db\n")
+    with pytest.raises(ConfigError, match="secret_key"):
+        Config.from_yaml(path)
+
+
+def test_config_load_dispatch(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "cfg.yaml"
+    path.write_text(f"secret_key: {_SECRET}\n")
+    assert Config.load(path).secret_key_value == _SECRET
+    monkeypatch.setenv("AISTAMP_SECRET_KEY", _SECRET)
+    monkeypatch.delenv("AISTAMP_DATABASE_URL", raising=False)
+    assert Config.load(None).secret_key_value == _SECRET
+
+
+def test_config_yaml_roundtrip_with_interpolation(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AISTAMP_TEST_KID", "rotated")
+    path = tmp_path / "cfg.yaml"
+    path.write_text(f"secret_key: {_SECRET}\nkey_id: ${{AISTAMP_TEST_KID}}\n")
+    assert Config.from_yaml(path).key_id == "rotated"
+
+
+# ---------------------------------------------------------------------------
+# Coverage: HTTP transport error taxonomy
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_http_error_taxonomy() -> None:
+    assert isinstance(wrap_http_error(TimeoutError("t")), ProviderTimeoutError)
+    auth = wrap_http_error(HTTPError("http://x", 401, "no", {}, None))
+    assert isinstance(auth, ProviderAuthError)
+    assert auth.status_code == 401
+    resp = wrap_http_error(HTTPError("http://x", 503, "down", {}, None))
+    assert isinstance(resp, ProviderResponseError)
+    assert resp.status_code == 503
+    assert isinstance(
+        wrap_http_error(URLError(TimeoutError("socket"))), ProviderTimeoutError
+    )
+    conn = wrap_http_error(URLError(OSError("refused")))
+    assert isinstance(conn, ProviderResponseError)
+
+
+def test_parse_retry_after_edge_cases() -> None:
+    assert http_module._parse_retry_after(None) is None
+    assert http_module._parse_retry_after({"Retry-After": "soon"}) is None
+
+
+def test_generic_http_client_timeout_wraps_taxonomy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = GenericHTTPClient("http://provider.invalid/v1/chat")
+
+    def _raise(*args: Any, **kwargs: Any) -> None:
+        raise TimeoutError("socket timed out")
+
+    monkeypatch.setattr(http_module, "urlopen", _raise)
+    with pytest.raises(ProviderTimeoutError):
+        client.complete("p", "m")
+
+
+# ---------------------------------------------------------------------------
+# Coverage: constructor validation and stream failure paths
+# ---------------------------------------------------------------------------
+
+
+def test_sync_constructor_validation(backend: SQLiteBackend) -> None:
+    def _mk(**kw: Any) -> ProvenanceClient:
+        return _client(lambda p: "x", backend, **kw)
+
+    with pytest.raises(ValueError, match="max_retries"):
+        _mk(max_retries=-1)
+    with pytest.raises(ValueError, match="delays"):
+        _mk(retry_base_delay=0)
+    with pytest.raises(ValueError, match="request_timeout"):
+        _mk(request_timeout=0)
+    with pytest.raises(ValueError, match="max_tokens"):
+        _mk(max_tokens=0)
+
+    async def _cb(record: Any, error: Any) -> None:
+        return None
+
+    with pytest.raises(TypeError, match="synchronous callable"):
+        _mk(on_persist_error=_cb)
+
+
+def test_async_constructor_validation(backend: SQLiteBackend) -> None:
+    def _mk(**kw: Any) -> AsyncProvenanceClient:
+        return AsyncProvenanceClient(
+            lambda p: "x",
+            config=_config(),
+            app_id="app",
+            feature_id="feat",
+            user_id="user",
+            backend=backend,
+            **kw,
+        )
+
+    with pytest.raises(ValueError, match="max_retries"):
+        _mk(max_retries=-1)
+    with pytest.raises(ValueError, match="delays"):
+        _mk(retry_base_delay=0)
+    with pytest.raises(ValueError, match="request_timeout"):
+        _mk(request_timeout=0)
+    with pytest.raises(ValueError, match="max_tokens"):
+        _mk(max_tokens=0)
+    with pytest.raises(TypeError, match="callable"):
+        _mk(on_persist_error="nope")
+
+
+class _BrokenStreamOpenAI(_FakeOpenAI):
+    """Streams one chunk then explodes mid-iteration."""
+
+    def _create(self, **kwargs: Any) -> Iterator[Any]:
+        self.calls.append(kwargs)
+
+        def _gen() -> Iterator[Any]:
+            yield _chunk("partial ")
+            raise RuntimeError("mid-stream explosion")
+
+        return _gen()
+
+
+class _BrokenAsyncStreamOpenAI(_FakeAsyncOpenAI):
+    """Async twin: streams one chunk then explodes mid-iteration."""
+
+    async def _create(self, **kwargs: Any) -> AsyncIterator[Any]:
+        self.calls.append(kwargs)
+
+        async def _gen() -> AsyncIterator[Any]:
+            yield _chunk("partial ")
+            raise RuntimeError("async mid-stream explosion")
+
+        return _gen()
+
+
+def test_sync_stream_mid_stream_error_persists_record(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    _install_sdk(
+        monkeypatch, "openai", OpenAI=_BrokenStreamOpenAI, AsyncOpenAI=_FakeAsyncOpenAI
+    )
+    client = _client(_BrokenStreamOpenAI(), backend)
+    stream = client.stamp_stream("q")
+    with pytest.raises(StampError, match="mid-stream explosion"):
+        list(stream)
+    report = backend.query(QueryFilters(user_id="user"))
+    assert report.total_count == 1
+    assert report.records[0].error_type == "RuntimeError"
+    assert report.records[0].error_message == "mid-stream explosion"
+
+
+@pytest.mark.asyncio
+async def test_async_stream_mid_stream_error_persists_record(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    _install_sdk(
+        monkeypatch,
+        "openai",
+        OpenAI=_FakeOpenAI,
+        AsyncOpenAI=_BrokenAsyncStreamOpenAI,
+    )
+    client = AsyncProvenanceClient(
+        _BrokenAsyncStreamOpenAI(),
+        config=_config(),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+    stream = await client.stamp_stream("q")
+    with pytest.raises(StampError, match="async mid-stream explosion"):
+        [chunk async for chunk in stream]
+    report = backend.query(QueryFilters(user_id="user"))
+    assert report.total_count == 1
+    assert report.records[0].error_type == "RuntimeError"
+
+
+def test_sync_stream_dispatch_fallthrough_rejects(backend: SQLiteBackend) -> None:
+    client = _client(GenericHTTPClient("http://provider.invalid"), backend)
+    with pytest.raises(StampError, match="streaming is not supported"):
+        list(client._stream_dispatch("q", "m", {}, []))
+
+
+@pytest.mark.asyncio
+async def test_async_stream_result_unavailable_before_exhaustion(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    fake = _FakeAsyncOpenAI(stream_chunks=[_chunk("a")])
+    _install_sdk(
+        monkeypatch, "openai", OpenAI=_FakeOpenAI, AsyncOpenAI=_FakeAsyncOpenAI
+    )
+    client = AsyncProvenanceClient(
+        fake,
+        config=_config(),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+    stream = await client.stamp_stream("q")
+    with pytest.raises(StampError, match="fully consumed"):
+        stream.result  # noqa: B018 — the property raising IS the assertion
+
+
+@pytest.mark.asyncio
+async def test_async_stream_stamps_concatenation_anthropic(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    fake = _FakeAsyncAnthropic(
+        stream_texts=["alpha ", "beta"],
+        final_usage=SimpleNamespace(input_tokens=7, output_tokens=9),
+    )
+    _install_sdk(
+        monkeypatch,
+        "anthropic",
+        Anthropic=_FakeAnthropic,
+        AsyncAnthropic=_FakeAsyncAnthropic,
+    )
+    client = AsyncProvenanceClient(
+        fake,
+        config=_config(),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+    stream = await client.stamp_stream("q")
+    parts = [chunk async for chunk in stream]
+    assert parts == ["alpha ", "beta"]
+    result = stream.result
+    assert result.text == "alpha beta"
+    assert result.usage == TokenUsage(prompt_tokens=7, response_tokens=9)
+
+
+# ---------------------------------------------------------------------------
+# Coverage: async dispatch error paths and policy
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_async_stamp_wraps_generic_provider_exception(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    _install_sdk(
+        monkeypatch, "openai", OpenAI=_FakeOpenAI, AsyncOpenAI=_FakeAsyncOpenAI
+    )
+    fake = _FakeAsyncOpenAI(errors=[RuntimeError("boom")])
+    client = AsyncProvenanceClient(
+        fake,
+        config=_config(),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+    with pytest.raises(StampError, match="boom") as exc_info:
+        await client.stamp("q")
+    assert exc_info.value.content_id is not None
+    report = backend.query(QueryFilters(user_id="user"))
+    assert report.total_count == 1
+    assert report.records[0].error_type == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_async_stamp_propagates_ai_stamp_error(
+    monkeypatch: pytest.MonkeyPatch, backend: SQLiteBackend
+) -> None:
+    _install_sdk(
+        monkeypatch, "openai", OpenAI=_FakeOpenAI, AsyncOpenAI=_FakeAsyncOpenAI
+    )
+    fake = _FakeAsyncOpenAI(errors=[ProviderAuthError("denied")])
+    client = AsyncProvenanceClient(
+        fake,
+        config=_config(),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+    with pytest.raises(ProviderAuthError) as exc_info:
+        await client.stamp("q")
+    assert exc_info.value.content_id is not None
+
+
+@pytest.mark.asyncio
+async def test_async_policy_block_persists_error_record(
+    backend: SQLiteBackend,
+) -> None:
+    engine = PolicyEngine(
+        rules=[RuleConfig("block_all", RuleConditions(), PolicyAction.BLOCK)],
+        model_tiers={},
+    )
+    client = AsyncProvenanceClient(
+        lambda p: "x",
+        config=_config(),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+        engine=engine,
+    )
+    with pytest.raises(PolicyViolationError):
+        await client.stamp("q")
+    report = backend.query(QueryFilters(user_id="user"))
+    assert report.total_count == 1  # blocked call still persists evidence
+
+
+@pytest.mark.asyncio
+async def test_async_callable_non_str_rejected(backend: SQLiteBackend) -> None:
+    client = AsyncProvenanceClient(
+        lambda p: 123,
+        config=_config(),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+    with pytest.raises(StampError, match="must return str"):
+        await client.stamp("q")
+
+
+@pytest.mark.asyncio
+async def test_async_create_tables_with_sync_backend(backend: SQLiteBackend) -> None:
+    client = AsyncProvenanceClient(
+        lambda p: "x",
+        config=_config(),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        backend=backend,
+    )
+    await client.create_tables()  # sync backend DDL stays on the loop
+
+
+def test_build_default_async_backend_postgres() -> None:
+    pytest.importorskip("asyncpg")
+    backend = _build_default_async_backend("postgresql+asyncpg://u:p@localhost/db")
+    assert isinstance(backend, AsyncPostgreSQLBackend)
+    with pytest.raises(ConfigError, match="database_url"):
+        _build_default_async_backend("mysql://u:p@localhost/db")
+
+
+# ---------------------------------------------------------------------------
+# Coverage: pipeline helpers (classification, policy WARN, persist hooks)
+# ---------------------------------------------------------------------------
+
+
+def _ctx(**overrides: Any) -> CaptureContext:
+    fields: dict[str, Any] = dict(
+        content_id=str(uuid.uuid4()),
+        app_id="app",
+        feature_id="feat",
+        user_id="user",
+        model="m",
+        prompt="p",
+        prompt_hash=hash_content("p"),
+        start_time=0,
+        timestamp=datetime.now(timezone.utc),
+    )
+    fields.update(overrides)
+    return CaptureContext(**fields)
+
+
+def _pii_result() -> PIIResult:
+    return PIIResult(
+        prompt_matches=[], response_matches=[], highest_severity=None, match_count=0
+    )
+
+
+def test_classify_provider_error_matrix() -> None:
+    class _Status(Exception):
+        def __init__(self, status: int) -> None:
+            self.status_code = status
+
+    rate = classify_provider_error(_Status(429), content_id="c")
+    assert isinstance(rate, ProviderRateLimitError)
+    assert rate.content_id == "c"
+    assert isinstance(
+        classify_provider_error(_Status(500), content_id="c"), ProviderResponseError
+    )
+    assert isinstance(
+        classify_provider_error(TimeoutError("t"), content_id="c"), ProviderTimeoutError
+    )
+    generic = classify_provider_error(RuntimeError("x"), content_id="c")
+    assert isinstance(generic, StampError)
+    assert generic.content_id == "c"
+    already = ProviderAuthError("a")
+    out = classify_provider_error(already, content_id="c")
+    assert out is already
+    assert already.content_id == "c"
+
+
+def test_apply_pre_call_policy_warn_branch() -> None:
+    ctx = _ctx()
+    engine = PolicyEngine(
+        rules=[RuleConfig("warn_all", RuleConditions(), PolicyAction.WARN)],
+        model_tiers={},
+    )
+    apply_pre_call_policy(ctx, _pii_result(), engine)
+    assert ctx.policy_decision is not None
+    assert ctx.policy_decision.action == PolicyAction.WARN
+
+
+def test_redact_prompt_missing_module_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "aistamp.pii", None)
+    with pytest.raises(AIStampError, match="redact_before_send"):
+        pipeline_module.redact_prompt("hello")
+
+
+def test_report_persist_failure_callback_invoked_and_swallowed(
+    backend: SQLiteBackend,
+) -> None:
+    record = pipeline_module.build_record(_ctx())
+    calls: list[Any] = []
+    report_persist_failure(
+        record, RuntimeError("persist down"), lambda r, e: calls.append((r, e))
+    )
+    assert len(calls) == 1
+
+    def _bad(record: Any, error: Any) -> None:
+        raise RuntimeError("callback blew up")
+
+    report_persist_failure(record, RuntimeError("persist down"), _bad)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_report_persist_failure_async_awaits_and_swallows(
+    backend: SQLiteBackend,
+) -> None:
+    record = pipeline_module.build_record(_ctx())
+    calls: list[str] = []
+
+    async def _cb(r: Any, e: Any) -> None:
+        calls.append(r.content_id)
+
+    await report_persist_failure_async(record, RuntimeError("x"), _cb)
+    assert calls == [record.content_id]
+
+    async def _bad(r: Any, e: Any) -> None:
+        raise RuntimeError("cb")
+
+    await report_persist_failure_async(record, RuntimeError("x"), _bad)  # swallowed
+
+
+def test_try_persist_sync_reports_failure(
+    backend: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = _ctx()
+
+    def _fail(record: Any, config: Any) -> None:
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(pipeline_module, "persist_record", _fail)
+    calls: list[Any] = []
+    try_persist_sync(ctx, backend, _config(), lambda r, e: calls.append(r))
+    assert len(calls) == 1
+
+
+def test_try_persist_sync_build_failure_is_swallowed(
+    backend: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom(record: Any) -> ProvenanceRecord:
+        raise RuntimeError("no record")
+
+    monkeypatch.setattr(pipeline_module, "build_record", _boom)
+    try_persist_sync(_ctx(), backend, _config(), None)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_try_persist_async_reports_failure(
+    backend: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = _ctx()
+
+    async def _fail(record: Any, config: Any) -> None:
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(pipeline_module, "persist_record_async", _fail)
+    calls: list[Any] = []
+    await try_persist_async(ctx, backend, _config(), lambda r, e: calls.append(r))
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_try_persist_async_build_failure_is_swallowed(
+    backend: SQLiteBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom(record: Any) -> ProvenanceRecord:
+        raise RuntimeError("no record")
+
+    monkeypatch.setattr(pipeline_module, "build_record", _boom)
+    await try_persist_async(_ctx(), backend, _config(), None)  # must not raise
