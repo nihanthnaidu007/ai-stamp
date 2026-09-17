@@ -152,6 +152,11 @@ class QueryFilters(BaseModel):
     cursor: str | None = None
     limit: int = 100
     offset: int = 0
+    # Evidence rule (security audit P1-3): PENDING write-ahead records are
+    # crash-interrupted, incomplete evidence. query() excludes them unless
+    # the caller opts in here or filters status=PENDING explicitly, so
+    # reports and exports never present incomplete evidence as complete.
+    include_pending: bool = False
 
     @field_validator("limit")
     @classmethod
@@ -199,3 +204,21 @@ class AuditReport(_FrozenModel):
     # Opaque keyset cursor for the next page; None when no more results.
     # Feed it back as QueryFilters.cursor.
     next_cursor: str | None = None
+
+
+class PurgeAnchor(_FrozenModel):
+    """One retention-purge event: proof that records were legitimately removed.
+
+    purge() writes an anchor in the same transaction as the deletes, listing
+    the chain positions (prev_hash values) the purge removed — retention and
+    the hash chain stop cancelling each other out (security audit P1-5).
+    ``signature`` is reserved for the signing layer; the store never holds
+    the HMAC key.
+    """
+
+    id: int
+    purged_before: datetime
+    purged_count: int
+    deleted_prev_hashes: list[str | None]
+    anchor_created_at: datetime
+    signature: str | None = None

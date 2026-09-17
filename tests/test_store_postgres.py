@@ -244,6 +244,11 @@ def test_postgres_purge_and_write_ahead() -> None:
 
         assert backend.purge(7, now=now) >= 2
         assert backend.get(old_ids[0]) is None
+        # P1-5: the purge must be journaled so chain-linked deletion is
+        # detectable — an unanchored chain gap is tampering evidence.
+        anchors = backend.list_purge_anchors()
+        assert anchors, "every purge must write a chain anchor"
+        assert sum(anchor.purged_count for anchor in anchors) >= 2
 
         final = pending.model_copy(update={"status": RecordStatus.COMPLETED})
         backend.finalize(pending.content_id, final, "h")

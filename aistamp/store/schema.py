@@ -74,3 +74,27 @@ class ProvenanceRecordORM(Base):
             postgresql_using="gin",
         ),
     )
+
+
+class PurgeAnchorORM(Base):
+    """Append-only retention journal: one row per purge() operation.
+
+    Retention deletes chain-linked rows; without a journal that deletion is
+    undetectable — the survivor's prev_hash points at a vanished record and
+    nothing explains the gap. Every purge writes an anchor in the same
+    transaction as the deletes, listing the chain positions it legitimately
+    removed, so an unanchored chain gap is evidence of tampering rather than
+    routine retention (security audit P1-5). ``signature`` is reserved for
+    the signing layer; the store never holds the HMAC key.
+    """
+
+    __tablename__ = "purge_anchors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    purged_before: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    purged_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    deleted_prev_hashes: Mapped[list[str | None]] = mapped_column(
+        JSONType, nullable=False
+    )
+    anchor_created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    signature: Mapped[str | None] = mapped_column(String(512), nullable=True)

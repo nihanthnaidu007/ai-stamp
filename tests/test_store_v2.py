@@ -17,6 +17,7 @@ from alembic.config import Config
 from pydantic import ValidationError
 from sqlalchemy import text
 
+from aistamp.audit.exporter import AuditExporter
 from aistamp.models import ProvenanceRecord, QueryFilters, RecordStatus
 from aistamp.store import AsyncBufferedWriter, BufferedWriter, SQLiteBackend
 from aistamp.store.async_backend import AsyncSQLiteBackend
@@ -808,3 +809,189 @@ async def test_async_buffered_writer_rebuffers_failed_batch(tmp_path: Path) -> N
         assert (await backend.query(QueryFilters(limit=1000))).total_count == 2
     finally:
         await backend.close()
+
+
+# --- Security audit P1-3: PENDING evidence must not present as final --------
+
+
+def test_query_excludes_pending_by_default(file_backend: SQLiteBackend) -> None:
+    file_backend.write(_make_record(), None)  # COMPLETED
+    file_backend.write(_make_record(status=RecordStatus.PENDING), None)
+
+    report = file_backend.query(QueryFilters())
+
+    assert [r.status for r in report.records] == [RecordStatus.COMPLETED]
+    assert report.total_count == 1
+    assert report.filters_applied["include_pending"] is False
+
+
+def test_query_include_pending_opt_in(file_backend: SQLiteBackend) -> None:
+    file_backend.write(_make_record(), None)
+    file_backend.write(_make_record(status=RecordStatus.PENDING), None)
+
+    report = file_backend.query(QueryFilters(include_pending=True))
+
+    assert report.total_count == 2
+    assert {r.status for r in report.records} == {
+        RecordStatus.COMPLETED,
+        RecordStatus.PENDING,
+    }
+
+
+def test_query_explicit_pending_status_returns_pending(
+    file_backend: SQLiteBackend,
+) -> None:
+    """Filtering status=PENDING is explicit intent — the opt-in flag is for
+    report/export paths that must not see incomplete evidence by default."""
+    file_backend.write(_make_record(status=RecordStatus.PENDING), None)
+
+    report = file_backend.query(QueryFilters(status=RecordStatus.PENDING))
+
+    assert report.total_count == 1
+    assert report.records[0].status is RecordStatus.PENDING
+
+
+def test_export_csv_excludes_pending_by_default(
+    file_backend: SQLiteBackend,
+) -> None:
+    """The auditor's PoV: to_csv used to emit PENDING rows verbatim."""
+    file_backend.write(_make_record(), None)
+    file_backend.write(_make_record(status=RecordStatus.PENDING), None)
+    exporter = AuditExporter(file_backend)
+
+    default_csv = exporter.to_csv(exporter.query(QueryFilters()))
+    opt_in_csv = exporter.to_csv(exporter.query(QueryFilters(include_pending=True)))
+
+    assert "PENDING" not in default_csv
+    assert "PENDING" in opt_in_csv  # surfaced loudly, with its status column
+
+
+@pytest.mark.asyncio
+async def test_async_query_excludes_pending_by_default(tmp_path: Path) -> None:
+    backend = AsyncSQLiteBackend(f"sqlite+aiosqlite:///{tmp_path / 'pending.db'}")
+    await backend.create_tables()
+    try:
+        await backend.write(_make_record(), None)
+        await backend.write(_make_record(status=RecordStatus.PENDING), None)
+
+        report = await backend.query(QueryFilters())
+        assert report.total_count == 1
+        assert report.records[0].status is RecordStatus.COMPLETED
+
+        opt_in = await backend.query(QueryFilters(include_pending=True))
+        assert opt_in.total_count == 2
+    finally:
+        await backend.close()
+
+
+# --- Security audit P1-5: chain-linked deletion must be detectable ----------
+
+
+def test_purge_writes_anchor_and_preserves_survivor(
+    file_backend: SQLiteBackend,
+) -> None:
+    base_ts = datetime(2026, 9, 17, 0, 0, tzinfo=timezone.utc)
+    old_1 = _make_record(timestamp=base_ts)
+    old_2 = _make_record(timestamp=base_ts + timedelta(minutes=1), prev_hash="c" * 64)
+    survivor = _make_record(
+        timestamp=base_ts + timedelta(minutes=2), prev_hash="d" * 64
+    )
+    for record in (old_1, old_2, survivor):
+        file_backend.write(record, None)
+
+    # Cutoff lands between old_2 and survivor: now - 1 day == base_ts + 90 s.
+    now = base_ts + timedelta(days=1, seconds=90)
+    deleted = file_backend.purge(1, now=now)
+
+    assert deleted == 2
+    fetched, _ = file_backend.get(survivor.content_id) or (None, None)
+    assert fetched is not None and fetched.prev_hash == "d" * 64
+
+    anchors = file_backend.list_purge_anchors()
+    assert len(anchors) == 1
+    anchor = anchors[0]
+    assert anchor.purged_count == 2
+    expected_cutoff = (base_ts + timedelta(seconds=90)).replace(tzinfo=None)
+    assert anchor.purged_before.replace(tzinfo=None) == expected_cutoff
+    assert anchor.deleted_prev_hashes == [None, "c" * 64]  # chain order
+    assert anchor.anchor_created_at.replace(tzinfo=None) == now.replace(tzinfo=None)
+
+
+def test_purge_noop_writes_no_anchor(file_backend: SQLiteBackend) -> None:
+    file_backend.write(_make_record(), None)
+
+    deleted = file_backend.purge(30, now=datetime(2026, 9, 17, tzinfo=timezone.utc))
+
+    assert deleted == 0
+    assert file_backend.list_purge_anchors() == []
+
+
+def test_purge_anchor_journal_persists_across_reopen(tmp_path: Path) -> None:
+    url = f"sqlite:///{tmp_path / 'journal.db'}"
+    backend = SQLiteBackend(url)
+    backend.create_tables()
+    backend.write(
+        _make_record(timestamp=datetime(2026, 9, 15, tzinfo=timezone.utc)), None
+    )
+    assert backend.purge(1, now=datetime(2026, 9, 18, tzinfo=timezone.utc)) == 1
+    backend.close()
+
+    reopened = SQLiteBackend(url)
+    try:
+        anchors = reopened.list_purge_anchors()
+        assert len(anchors) == 1
+        assert anchors[0].purged_count == 1
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_async_purge_writes_anchor(tmp_path: Path) -> None:
+    backend = AsyncSQLiteBackend(f"sqlite+aiosqlite:///{tmp_path / 'anchor.db'}")
+    await backend.create_tables()
+    try:
+        base_ts = datetime(2026, 9, 17, 0, 0, tzinfo=timezone.utc)
+        await backend.write(_make_record(timestamp=base_ts, prev_hash="e" * 64), None)
+
+        deleted = await backend.purge(1, now=base_ts + timedelta(days=1, seconds=1))
+
+        assert deleted == 1
+        anchors = await backend.list_purge_anchors()
+        assert len(anchors) == 1
+        assert anchors[0].purged_count == 1
+        assert anchors[0].deleted_prev_hashes == ["e" * 64]
+    finally:
+        await backend.close()
+
+
+def test_migration_creates_purge_anchor_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Migration 0002 and create_tables() must both produce the journal."""
+    monkeypatch.delenv("AISTAMP_DATABASE_URL", raising=False)
+    db_path = tmp_path / "anchor-migrate.db"
+    cfg = _alembic_config(f"sqlite:///{db_path}")
+    command.upgrade(cfg, "head")
+
+    backend = SQLiteBackend(f"sqlite:///{tmp_path / 'anchor-createall.db'}")
+    backend.create_tables()
+    backend.close()
+
+    def _journal_columns(path: Path) -> set[str]:
+        raw = sqlite3.connect(path)
+        try:
+            return {row[1] for row in raw.execute("PRAGMA table_info(purge_anchors)")}
+        finally:
+            raw.close()
+
+    assert _journal_columns(db_path) == _journal_columns(
+        tmp_path / "anchor-createall.db"
+    )
+    assert {
+        "id",
+        "purged_before",
+        "purged_count",
+        "deleted_prev_hashes",
+        "anchor_created_at",
+        "signature",
+    } <= _journal_columns(db_path)

@@ -4,11 +4,10 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
-from typing import Any, cast
+from typing import Any
 
 from sqlalchemy import (
     ColumnElement,
-    CursorResult,
     Engine,
     Select,
     and_,
@@ -27,10 +26,11 @@ from aistamp.models import (
     PolicyAction,
     PolicyDecision,
     ProvenanceRecord,
+    PurgeAnchor,
     QueryFilters,
     RecordStatus,
 )
-from aistamp.store.schema import Base, ProvenanceRecordORM
+from aistamp.store.schema import Base, ProvenanceRecordORM, PurgeAnchorORM
 
 # TODO(phase-v2): Redis backend for high-throughput event streaming
 
@@ -86,6 +86,11 @@ class StoreBackend(ABC):
     @abstractmethod
     def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
         """Delete records older than retention_days. Returns the deleted count."""
+        ...
+
+    @abstractmethod
+    def list_purge_anchors(self) -> list[PurgeAnchor]:
+        """Return the retention journal (purge anchors), oldest first."""
         ...
 
     @abstractmethod
@@ -239,6 +244,12 @@ def _build_filter_conditions(filters: QueryFilters) -> list[Any]:
         conditions.append(ProvenanceRecordORM.timestamp >= filters.from_dt)
     if filters.to_dt is not None:
         conditions.append(ProvenanceRecordORM.timestamp <= filters.to_dt)
+    # Evidence rule (security audit P1-3): PENDING write-ahead records are
+    # crash-interrupted, incomplete evidence — they must never present as
+    # final in reports/exports. Included only on explicit opt-in.
+    explicit_pending = filters.include_pending or filters.status is RecordStatus.PENDING
+    if not explicit_pending:
+        conditions.append(ProvenanceRecordORM.status != RecordStatus.PENDING.value)
     return conditions
 
 
@@ -425,16 +436,70 @@ class _SyncSQLAlchemyBackend(StoreBackend):
             )
 
     def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
+        """Delete records older than retention_days. Returns the deleted count.
+
+        Every purge writes a PurgeAnchor in the SAME transaction as the
+        deletes, listing the chain positions (prev_hash values) removed:
+        a later chain gap is either anchored (legitimate retention) or
+        unexplained (tampering evidence). Chain-linked deletion is never
+        silent. (Security audit P1-5.)
+        """
         cutoff = _retention_cutoff(retention_days, now)
+        run_at = _to_naive_utc(now if now is not None else datetime.now(timezone.utc))
         with Session(self._engine) as session:
-            result = session.execute(
+            doomed_hashes: list[str | None] = list(
+                session.execute(
+                    select(ProvenanceRecordORM.prev_hash)
+                    .where(ProvenanceRecordORM.timestamp < cutoff)
+                    .order_by(
+                        ProvenanceRecordORM.timestamp.asc(),
+                        ProvenanceRecordORM.id.asc(),
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not doomed_hashes:
+                return 0
+            session.add(
+                PurgeAnchorORM(
+                    purged_before=cutoff,
+                    purged_count=len(doomed_hashes),
+                    deleted_prev_hashes=doomed_hashes,
+                    anchor_created_at=run_at,
+                )
+            )
+            session.execute(
                 delete(ProvenanceRecordORM).where(
                     ProvenanceRecordORM.timestamp < cutoff
                 )
             )
             session.commit()
-            # DML executes return CursorResult at runtime; rowcount lives there.
-            return int(cast("CursorResult[Any]", result).rowcount or 0)
+            return len(doomed_hashes)
+
+    def list_purge_anchors(self) -> list[PurgeAnchor]:
+        """Return the retention journal (oldest anchor first)."""
+        with Session(self._engine) as session:
+            rows = (
+                session.execute(
+                    select(PurgeAnchorORM).order_by(PurgeAnchorORM.id.asc())
+                )
+                .scalars()
+                .all()
+            )
+            return [
+                PurgeAnchor(
+                    id=row.id,
+                    purged_before=row.purged_before.replace(tzinfo=timezone.utc),
+                    purged_count=row.purged_count,
+                    deleted_prev_hashes=list(row.deleted_prev_hashes or []),
+                    anchor_created_at=row.anchor_created_at.replace(
+                        tzinfo=timezone.utc
+                    ),
+                    signature=row.signature,
+                )
+                for row in rows
+            ]
 
     def close(self) -> None:
         self._engine.dispose()
