@@ -708,6 +708,56 @@ def test_yaml_duplicate_pattern_names_raise(tmp_path: Path) -> None:
         load_patterns_from_yaml(path)
 
 
+def test_extra_pattern_shadowing_builtin_rejected() -> None:
+    # A custom pattern reusing a built-in name would silently race the
+    # original during arbitration and split per-pattern config lookups.
+    shadow = PatternConfig(
+        name="CREDIT_CARD",
+        pattern=r"\b\d{16}\b",
+        severity=PIISeverity.HIGH,
+    )
+    with pytest.raises(ValueError, match="CREDIT_CARD"):
+        scan_text("Card 4111111111111111", extra_patterns=[shadow])
+
+
+def test_extra_pattern_shadowing_locale_pattern_rejected() -> None:
+    shadow = PatternConfig(
+        name="AADHAAR",
+        pattern=r"\b\d{12}\b",
+        severity=PIISeverity.HIGH,
+    )
+    with pytest.raises(ValueError, match="AADHAAR"):
+        scan_text("ID 2346 2678 9001", extra_patterns=[shadow], locale="INDIA")
+
+
+def test_duplicate_extra_pattern_names_rejected() -> None:
+    dup = PatternConfig(
+        name="DOUBLE_ENTRY",
+        pattern=r"x",
+        severity=PIISeverity.LOW,
+    )
+    with pytest.raises(ValueError, match="DOUBLE_ENTRY"):
+        scan_text("x", extra_patterns=[dup, dup])
+
+
+def test_distinct_extra_pattern_names_still_accepted() -> None:
+    # Guard the rejection rule against over-blocking: a unique extra name
+    # next to built-ins and a locale pack must scan normally.
+    extra = PatternConfig(
+        name="EMPLOYEE_ID",
+        pattern=r"EMP-\d{6}",
+        severity=PIISeverity.LOW,
+    )
+    matches = scan_text(
+        "Employee EMP-123456, id 2346 2678 9001",
+        extra_patterns=[extra],
+        locale="INDIA",
+    )
+    names = {m.pattern_name for m in matches}
+    assert "EMPLOYEE_ID" in names
+    assert "AADHAAR" in names
+
+
 def test_yaml_confidence_out_of_range_raises(tmp_path: Path) -> None:
     path = tmp_path / "conf.yaml"
     path.write_text(

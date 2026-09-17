@@ -65,6 +65,24 @@ def _is_allowlisted(value: str, entries: Sequence[str]) -> bool:
             return True
     return False
 
+def _reject_shadowed_names(
+    extras: Sequence[PatternConfig], reserved: set[str]
+) -> None:
+    """Reject extras that reuse a reserved pattern name.
+
+    A shadowing extra silently races the original during arbitration and
+    splits per-pattern allowlist/config lookups, so names taken by built-in
+    patterns, the active locale pack, or an earlier extra are refused.
+    """
+    for extra in extras:
+        if extra.name in reserved:
+            raise ValueError(
+                f"Extra pattern {extra.name!r} collides with a built-in, "
+                "locale-pack, or other extra pattern name; use a distinct "
+                "name."
+            )
+        reserved.add(extra.name)
+
 
 def _make_redacted_snippet(
     text: str,
@@ -154,6 +172,11 @@ def scan_text(
     Results are ordered by position with no overlapping spans (unless
     ``resolve_overlaps=False``, which restores the 0.1.x raw-union
     semantics).
+
+    Raises:
+        ValueError: If an ``extra_patterns`` entry reuses the name of a
+            built-in pattern, a pattern from the active locale pack, or
+            another extra pattern.
     """
     if not isinstance(text, str):
         raise TypeError(f"scan_text expected str, got {type(text).__name__}")
@@ -165,6 +188,7 @@ def scan_text(
     if locale is not None:
         configs.extend(get_locale_patterns(locale))
     if extra_patterns:
+        _reject_shadowed_names(extra_patterns, reserved={c.name for c in configs})
         configs.extend(extra_patterns)
 
     matches: list[PIIMatch] = []
