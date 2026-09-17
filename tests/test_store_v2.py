@@ -999,3 +999,32 @@ def test_migration_creates_purge_anchor_journal(
         "anchor_created_at",
         "signature",
     } <= _journal_columns(db_path)
+
+
+def test_finalize_refuses_overwriting_completed_history(
+    file_backend: SQLiteBackend,
+) -> None:
+    # P2-10: a COMPLETED record is history. finalize() may replay the
+    # identical final state (idempotent retry — no-op) but must never
+    # rewrite it.
+    pending = _make_record(status=RecordStatus.PENDING)
+    sig = "signed-" + "x" * 32
+    file_backend.write(pending, sig)
+
+    completed = pending.model_copy(update={"status": RecordStatus.COMPLETED})
+    file_backend.finalize(pending.content_id, completed, sig)  # lifecycle OK
+
+    # Identical replay: idempotent no-op, state unchanged (None keeps sig).
+    file_backend.finalize(pending.content_id, completed, sig)
+    file_backend.finalize(pending.content_id, completed, None)
+    fetched, stored_hmac = file_backend.get(pending.content_id) or (None, None)
+    assert fetched is not None and fetched.status == RecordStatus.COMPLETED
+    assert stored_hmac == sig, "replays must not alter the stored signature"
+
+    # A different final state must be refused, not overwrite history.
+    rewritten = completed.model_copy(update={"response_hash": "c" * 64})
+    with pytest.raises(ValueError, match="immutable history"):
+        file_backend.finalize(pending.content_id, rewritten, sig)
+    fetched2, _ = file_backend.get(pending.content_id) or (None, None)
+    assert fetched2 is not None
+    assert fetched2.response_hash == completed.response_hash
