@@ -22,6 +22,7 @@ from aistamp.client._pipeline import (
     validate_prompt,
 )
 from aistamp.client._providers import (
+    ANTHROPIC_DEFAULT_MAX_TOKENS,
     _import_anthropic,
     _import_openai,
     build_create_kwargs,
@@ -316,6 +317,16 @@ class AsyncProvenanceClient:
             # backends, and DDL is a one-shot call.
             self._backend.create_tables()
 
+    async def aclose(self) -> None:
+        """Release backend resources held by this client (awaitable).
+
+        Idempotent. Call it when the client's default async backend is used
+        and the process keeps running afterwards — an undisposed engine keeps
+        aiosqlite worker threads and pooled connections alive.
+        """
+        if isinstance(self._backend, AsyncStoreBackend):
+            await self._backend.close()
+
     # ------------------------------------------------------------------
     # Core pipeline
     # ------------------------------------------------------------------
@@ -510,6 +521,7 @@ class AsyncProvenanceClient:
                 provider_kwargs,
                 max_tokens=self._max_tokens,
                 request_timeout=self._request_timeout,
+                fallback_max_tokens=ANTHROPIC_DEFAULT_MAX_TOKENS,
             )
             resp = await client.messages.create(**create_kwargs)
             return parse_anthropic_response(resp)
@@ -622,6 +634,7 @@ class AsyncProvenanceClient:
             provider_kwargs,
             max_tokens=self._max_tokens,
             request_timeout=self._request_timeout,
+            fallback_max_tokens=ANTHROPIC_DEFAULT_MAX_TOKENS,
         )
         async with client.messages.stream(**create_kwargs) as stream:
             async for text in stream.text_stream:

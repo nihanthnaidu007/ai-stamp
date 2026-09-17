@@ -836,6 +836,7 @@ async def test_async_stamp_uses_aiosqlite_default_backend(
         fake, config=config, app_id="app", feature_id="feat", user_id="user"
     )
     result = await client.stamp("q")
+    await client.aclose()
     # Parity: the default async backend persisted a complete record.
     sync_reader = SQLiteBackend(f"sqlite:///{db_path}")
     report = sync_reader.query(QueryFilters(user_id="user"))
@@ -962,10 +963,21 @@ async def test_async_create_tables_parity(tmp_path: Any) -> None:
     )
     await client.create_tables()
     result = await client.stamp("q")
+    await client.aclose()
     sync_reader = SQLiteBackend(f"sqlite:///{db_path}")
     report = sync_reader.query(QueryFilters(user_id="user"))
     assert report.total_count == 1
     assert report.records[0].content_id == result.content_id
+
+
+@pytest.mark.asyncio
+async def test_async_aclose_is_idempotent(tmp_path: Any) -> None:
+    config = _config(database_url=f"sqlite:///{tmp_path / 'aclose.db'}")
+    client = AsyncProvenanceClient(
+        lambda p: "x", config=config, app_id="app", feature_id="feat", user_id="user"
+    )
+    await client.aclose()
+    await client.aclose()  # second dispose is a no-op, not an error
 
 
 @pytest.mark.asyncio

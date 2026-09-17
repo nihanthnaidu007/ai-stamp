@@ -16,6 +16,13 @@ from aistamp.errors import StampError
 _OPENAI_SYNC_MODEL_DEFAULT = "gpt-4o"
 _ANTHROPIC_SYNC_MODEL_DEFAULT = "claude-3-5-sonnet-20241022"
 
+# The Anthropic API requires max_tokens on every request (the real SDK marks it
+# as a required keyword), so the Anthropic dispatch paths fall back to the 0.1
+# default when neither the client-level nor a per-call value supplies one. It
+# is a documented compatibility default, no longer hardcoded: callers override
+# it via the ``max_tokens`` constructor argument or per-call kwarg.
+ANTHROPIC_DEFAULT_MAX_TOKENS = 1024
+
 
 def _import_openai() -> Any:
     try:
@@ -117,20 +124,27 @@ def build_create_kwargs(
     *,
     max_tokens: int | None,
     request_timeout: float | None,
+    fallback_max_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Merge caller kwargs with client defaults for one provider ``create`` call.
 
     An explicit ``messages`` kwarg replaces the default single-user-message
     payload (multi-turn support); the prompt remains what is hashed/stamped.
     ``max_tokens`` and ``timeout`` are client-level defaults; per-call kwargs
-    win.
+    win. ``fallback_max_tokens`` covers providers whose API requires the field
+    (Anthropic): when neither the client default nor a per-call kwarg supplies
+    it, the fallback is sent so the request stays valid.
     """
     kwargs: dict[str, Any] = dict(provider_kwargs)
     messages = kwargs.pop("messages", None)
     if messages is None:
         messages = [{"role": "user", "content": prompt}]
-    if max_tokens is not None and "max_tokens" not in kwargs:
-        kwargs["max_tokens"] = max_tokens
+    if "max_tokens" not in kwargs:
+        effective_max_tokens = (
+            max_tokens if max_tokens is not None else fallback_max_tokens
+        )
+        if effective_max_tokens is not None:
+            kwargs["max_tokens"] = effective_max_tokens
     if request_timeout is not None and "timeout" not in kwargs:
         kwargs["timeout"] = request_timeout
     kwargs["model"] = model
@@ -197,6 +211,7 @@ def dispatch_sync(
             provider_kwargs,
             max_tokens=max_tokens,
             request_timeout=request_timeout,
+            fallback_max_tokens=ANTHROPIC_DEFAULT_MAX_TOKENS,
         )
         resp = client.messages.create(**create_kwargs)
         return parse_anthropic_response(resp)

@@ -90,14 +90,14 @@ class GenericHTTPClient:
             raise wrap_http_error(exc) from exc
         except URLError as exc:
             raise wrap_http_error(exc) from exc
-        except json.JSONDecodeError as exc:
-            raise ProviderResponseError(
-                f"Provider returned malformed JSON: {exc}"
-            ) from exc
 
+        # Transport failures are wrapped into the library taxonomy; response
+        # CONTENT problems stay ValueError-compatible (json.JSONDecodeError is
+        # a ValueError subclass), matching the 0.1 contract for callers that
+        # catch ValueError around malformed payloads.
         text = data.get("text", data.get("response"))
         if not isinstance(text, str):
-            raise ProviderResponseError(
+            raise ValueError(
                 "HTTP response must include string field 'text' or 'response'."
             )
         prompt_tokens = data.get("prompt_tokens")

@@ -21,6 +21,7 @@ from aistamp.client._pipeline import (
     validate_prompt,
 )
 from aistamp.client._providers import (
+    ANTHROPIC_DEFAULT_MAX_TOKENS,
     _import_anthropic,
     _import_openai,
     build_create_kwargs,
@@ -542,6 +543,7 @@ class ProvenanceClient:
             provider_kwargs,
             max_tokens=self._max_tokens,
             request_timeout=self._request_timeout,
+            fallback_max_tokens=ANTHROPIC_DEFAULT_MAX_TOKENS,
         )
         with client.messages.stream(**create_kwargs) as stream:
             for text in stream.text_stream:
