@@ -163,6 +163,32 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   undisposed aiosqlite engine previously leaked worker threads for the life
   of the process.
 
+### Security
+
+Final-tree hardening from the adversarial security audit (PR #17, #18):
+
+- `finalize()` refuses to overwrite an already-`COMPLETED` record's
+  history: an identical replay (including the `hmac_signature=None`
+  "keep stored signature" form) is an idempotent no-op; any divergent
+  final state raises `ValueError` instead of silently rewriting the audit
+  trail (audit P2-10). The guard is shared by the sync and async SQLite
+  backends.
+- Tamper sweep: retention purges write signed chain anchors in the same
+  transaction as the deletes; SQLite `update_record` takes an
+  `BEGIN IMMEDIATE` write lock, closing the read-modify-write race;
+  every query path's pagination order is pinned by a 510-record chain
+  walk test (PR #18).
+- All digest comparisons — chain-link `prev_hash` checks in
+  `verify_chain`, export verdicts, key-rotation lookups — now use
+  `hmac.compare_digest`.
+- Caller-supplied PII `extra_patterns` (and YAML custom patterns) are
+  validated through the policy layer's ReDoS safety analysis before
+  compilation; a nested-quantifier operator pattern raises `ValueError`
+  at `scan_text` instead of running against attacker-influenced text.
+  Built-in and locale packs remain exempt: the conservative analysis
+  rejects 4 of 9 built-ins for *bounded* group repetition, which cannot
+  backtrack catastrophically, and they are code-reviewed.
+
 ---
 
 ## [0.1.0] — 2026-05-30
