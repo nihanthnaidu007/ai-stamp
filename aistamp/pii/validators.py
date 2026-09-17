@@ -2,8 +2,15 @@
 
 Every validator receives the raw matched text and returns a confidence in
 ``(0.0, 1.0]`` — how likely the span is a *true* instance of the pattern
-type — or ``None`` to reject the candidate outright (failed checksums,
-structurally impossible values). Confidence 1.0 means the value passed the
+type — or ``None`` when the strongest available check for the type fails
+(bad checksums, structurally impossible values). Rejected candidates are
+kept as matches at ``VALIDATOR_REJECTED_CONFIDENCE`` (0.25) rather than
+dropped: redaction must fail closed, so a span shaped like the pattern
+type is still detected and redacted even when validation says it is not
+genuine, and it cannot leak raw into persisted ``redacted_snippet``
+context of neighboring matches.
+
+Confidence 1.0 means the value passed the
 strongest available check for its type (Luhn, Verhoeff, mod-97, range or
 structure rules); lower values mean the match is plausible but unverified.
 
@@ -235,6 +242,12 @@ def _validate_steuer_id(value: str) -> float | None:
     no_higher_repeats = all(n <= 2 for n in counts.values())
     return 1.0 if exactly_one_pair and no_higher_repeats else 0.5
 
+
+#: Confidence assigned to candidates whose per-type validator returned
+#: ``None``. Kept below every validator pass value (lowest is 0.5) so
+#: downstream policy can filter rejected-looking spans, but non-zero so
+#: fail-closed redaction still covers them.
+VALIDATOR_REJECTED_CONFIDENCE: float = 0.25
 
 VALIDATORS: dict[str, Validator] = {
     "CREDIT_CARD": _validate_credit_card,

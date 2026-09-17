@@ -19,6 +19,7 @@ from aistamp.pii import (
     scan_prompt_and_response,
     scan_text,
 )
+from aistamp.pii.validators import VALIDATOR_REJECTED_CONFIDENCE
 from aistamp.store import SQLiteBackend
 
 # ---------------------------------------------------------------------------
@@ -170,8 +171,12 @@ def test_credit_card_severity_is_high() -> None:
 
 
 def test_invalid_credit_card_fails_luhn_validation() -> None:
+    # Fail-closed (audit P1-4): a Luhn-failing candidate stays a match at
+    # reduced confidence instead of silently vanishing from redaction.
     matches = scan_text("Card: 1111 1111 1111 1111")
-    assert not any(m.pattern_name == PIIType.CREDIT_CARD.value for m in matches)
+    cards = [m for m in matches if m.pattern_name == PIIType.CREDIT_CARD.value]
+    assert len(cards) == 1
+    assert cards[0].confidence == VALIDATOR_REJECTED_CONFIDENCE
 
 
 # ---------------------------------------------------------------------------

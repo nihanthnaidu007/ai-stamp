@@ -26,6 +26,7 @@ from aistamp.pii import (
     scan_prompt_and_response,
     scan_text,
 )
+from aistamp.pii.validators import VALIDATOR_REJECTED_CONFIDENCE
 
 # ---------------------------------------------------------------------------
 # Test samples. GitHub-style tokens are built at runtime — realistic token
@@ -168,23 +169,34 @@ def test_ssn_valid_confidence_full() -> None:
 
 def test_ssn_900_series_rejected() -> None:
     # 900-999 area series was never issued (used by ITINs instead).
-    assert not any(m.pattern_name == "SSN" for m in scan_text("SSN 987-65-4321"))
+    # Fail-closed (audit P1-4): kept at rejected confidence, not dropped.
+    matches = matches_named("SSN 987-65-4321", "SSN")
+    assert len(matches) == 1
+    assert matches[0].confidence == VALIDATOR_REJECTED_CONFIDENCE
 
 
 def test_ssn_000_and_666_areas_rejected() -> None:
-    assert not any(m.pattern_name == "SSN" for m in scan_text("SSN 000-12-3456"))
-    assert not any(m.pattern_name == "SSN" for m in scan_text("SSN 666-12-3456"))
+    for text in ("SSN 000-12-3456", "SSN 666-12-3456"):
+        matches = matches_named(text, "SSN")
+        assert len(matches) == 1
+        assert matches[0].confidence == VALIDATOR_REJECTED_CONFIDENCE
 
 
 def test_ssn_group_00_and_serial_0000_rejected() -> None:
-    assert not any(m.pattern_name == "SSN" for m in scan_text("SSN 123-00-4567"))
-    assert not any(m.pattern_name == "SSN" for m in scan_text("SSN 123-45-0000"))
+    for text in ("SSN 123-00-4567", "SSN 123-45-0000"):
+        matches = matches_named(text, "SSN")
+        assert len(matches) == 1
+        assert matches[0].confidence == VALIDATOR_REJECTED_CONFIDENCE
 
 
-def test_phone_account_number_rejected() -> None:
-    # 10-digit account numbers must no longer surface as PHONE_US.
-    assert scan_text("Account 1002003004") == []
-    assert scan_text("Account 100-200-3004") == []
+def test_phone_account_number_low_confidence() -> None:
+    # 10-digit account numbers keep phone *shape* but fail NANP
+    # plausibility: they surface only at rejected confidence (audit P1-4
+    # fail-closed — redaction covers them, policy filters on confidence).
+    for text in ("Account 1002003004", "Account 100-200-3004"):
+        matches = matches_named(text, "PHONE_US")
+        assert len(matches) == 1
+        assert matches[0].confidence == VALIDATOR_REJECTED_CONFIDENCE
 
 
 def test_phone_implausible_exchange_low_confidence() -> None:
@@ -192,6 +204,35 @@ def test_phone_implausible_exchange_low_confidence() -> None:
     matches = matches_named("Call 555-123-4567", "PHONE_US")
     assert len(matches) == 1
     assert matches[0].confidence == 0.5
+
+
+def test_rejected_candidate_redacted_fail_closed() -> None:
+    # Audit P1-4 PoV: a Luhn-failing card next to a valid email. The card
+    # span must be redacted AND absent raw from every persisted snippet.
+    raw = "email john.doe@corp.example card 1234-5678-9012-3456 thanks"
+    card = "1234-5678-9012-3456"
+    matches = scan_text(raw)
+    assert any(m.pattern_name == "CREDIT_CARD" for m in matches)
+
+    assert card not in redact_text(raw)
+
+    for match in matches:
+        assert card not in match.redacted_snippet
+
+
+def test_snippet_fill_never_embeds_raw_neighbor_matches() -> None:
+    # General snippet guarantee (audit P1-4): no match's raw value — nor a
+    # fragment of one straddling the context-window edge — may appear raw
+    # in another match's persisted snippet.
+    text = "pad user1@example.com mid user2@example.com tail"
+    matches = scan_text(text)
+    assert len(matches) == 2
+    for match in matches:
+        assert "@example.com" not in match.redacted_snippet
+        for other in matches:
+            if other is match:
+                continue
+            assert text[other.start : other.end] not in match.redacted_snippet
 
 
 def test_phone_fictional_555_line_low_confidence() -> None:
@@ -492,10 +533,11 @@ def test_aadhaar_valid_contiguous_detected() -> None:
 
 
 def test_aadhaar_bad_checksum_rejected() -> None:
-    assert not any(
-        m.pattern_name == "AADHAAR"
-        for m in scan_text("ID 2345 6789 1237", locale="INDIA")
-    )
+    # Fail-closed (audit P1-4): bad Verhoeff stays a match at rejected
+    # confidence so redaction still covers the span.
+    matches = matches_named("ID 2345 6789 1237", "AADHAAR", locale="INDIA")
+    assert len(matches) == 1
+    assert matches[0].confidence == VALIDATOR_REJECTED_CONFIDENCE
 
 
 def test_aadhaar_not_detected_without_locale() -> None:
@@ -539,9 +581,11 @@ def test_iban_valid_contiguous_detected() -> None:
 
 
 def test_iban_bad_checksum_rejected() -> None:
-    assert not any(
-        m.pattern_name == "IBAN" for m in scan_text(f"pay {IBAN_INVALID}", locale="EU")
-    )
+    # Fail-closed (audit P1-4): mod-97 failure stays a match at rejected
+    # confidence so redaction still covers the span.
+    matches = matches_named(f"pay {IBAN_INVALID}", "IBAN", locale="EU")
+    assert len(matches) == 1
+    assert matches[0].confidence == VALIDATOR_REJECTED_CONFIDENCE
 
 
 def test_nino_detected() -> None:

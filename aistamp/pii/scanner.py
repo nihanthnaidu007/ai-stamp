@@ -36,7 +36,7 @@ from aistamp.models import SEVERITY_RANK, PIIMatch, PIIResult, PIISeverity
 from aistamp.pii.locales import get_locale_patterns
 from aistamp.pii.ner import NERConfig, scan_with_ner
 from aistamp.pii.patterns import BUILT_IN_PATTERNS, PatternConfig
-from aistamp.pii.validators import VALIDATORS
+from aistamp.pii.validators import VALIDATOR_REJECTED_CONFIDENCE, VALIDATORS
 
 logger = logging.getLogger("aistamp.pii")
 
@@ -202,7 +202,11 @@ def scan_text(
             if validator is not None:
                 confidence = validator(value)
                 if confidence is None:
-                    continue
+                    # Fail closed (audit P1-4): a rejected candidate stays a
+                    # match at reduced confidence so redaction still covers
+                    # the span and it cannot leak raw into persisted
+                    # redacted_snippet context of neighboring matches.
+                    confidence = VALIDATOR_REJECTED_CONFIDENCE
             else:
                 confidence = config.confidence
             matches.append(
