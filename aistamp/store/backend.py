@@ -63,6 +63,21 @@ class StoreBackend(ABC):
         """Create all tables. Dev/testing only — use Alembic in production."""
         ...
 
+    def update_record(
+        self, record: ProvenanceRecord, hmac_signature: str | None
+    ) -> None:
+        """Replace the stored row for ``record.content_id`` in place.
+
+        Optional capability: backends that cannot rewrite records (or async
+        backends, which are not reachable from the sync rotation workflow)
+        keep this default and aistamp.keys.rotate_secret(re_sign=True) will
+        refuse them with a RotationError.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support in-place record updates; "
+            "rotate_secret(re_sign=True) requires a backend with update_record()."
+        )
+
     @abstractmethod
     def finalize(
         self,
@@ -380,6 +395,30 @@ class _SyncSQLAlchemyBackend(StoreBackend):
             session.add(_record_to_orm(record, hmac_signature))
             session.commit()
 
+    def update_record(
+        self, record: ProvenanceRecord, hmac_signature: str | None
+    ) -> None:
+        with Session(self._engine) as session:
+            # Row lock closes the read-modify-write race between concurrent
+            # updaters (e.g. rotation re-signing vs. a concurrent finalize):
+            # PostgreSQL renders SELECT ... FOR UPDATE; SQLite ignores the
+            # clause and gets the equivalent serialization from its
+            # database-level write lock plus busy_timeout (see
+            # _register_sqlite_pragmas).
+            stmt = (
+                select(ProvenanceRecordORM)
+                .where(ProvenanceRecordORM.content_id == record.content_id)
+                .with_for_update()
+            )
+            row = session.execute(stmt).scalar_one_or_none()
+            if row is None:
+                raise ValueError(
+                    f"Cannot update: no provenance record with content_id "
+                    f"{record.content_id!r}"
+                )
+            _apply_record_to_orm(row, record, hmac_signature)
+            session.commit()
+
     def finalize(
         self,
         content_id: str,
@@ -392,8 +431,12 @@ class _SyncSQLAlchemyBackend(StoreBackend):
                 f"content_id {content_id!r}"
             )
         with Session(self._engine) as session:
-            stmt = select(ProvenanceRecordORM).where(
-                ProvenanceRecordORM.content_id == content_id
+            # Same read-modify-write shape as update_record — lock the row the
+            # same way (see update_record for the SQLite equivalence note).
+            stmt = (
+                select(ProvenanceRecordORM)
+                .where(ProvenanceRecordORM.content_id == content_id)
+                .with_for_update()
             )
             row = session.execute(stmt).scalar_one_or_none()
             if row is None:
