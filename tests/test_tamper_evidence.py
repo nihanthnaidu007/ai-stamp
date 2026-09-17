@@ -6,9 +6,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import threading
 import uuid
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from types import MappingProxyType
 
 import pytest
@@ -794,3 +797,55 @@ def test_config_rejects_short_secret_key() -> None:
 
     with pytest.raises(ValueError, match="at least 32 characters"):
         Config(secret_key="too-short")
+
+
+# ---------------------------------------------------------------------------
+# Group 10 — update_record concurrency (security audit P1: locked RMW)
+# ---------------------------------------------------------------------------
+
+
+def test_update_record_serializes_concurrent_writers(tmp_path: Path) -> None:
+    # update_record is a read-modify-write: without row locking, concurrent
+    # updaters (rotation re-signing vs. a concurrent finalize) can interleave
+    # their read and write phases. PostgreSQL serializes via SELECT ...
+    # FOR UPDATE; SQLite via its database-level write lock. Either way,
+    # every writer must land its full state and the surviving row must be
+    # signature-consistent — never a torn or half-applied update.
+    backend = SQLiteBackend(f"sqlite:///{tmp_path / 'concurrent.db'}")
+    backend.create_tables()
+    record = _make_record()
+    backend.write(record, sign_record(record, _OLD_KEY))
+
+    workers = 8
+    rewrites = 5
+    barrier = threading.Barrier(workers)
+    errors: list[Exception] = []
+
+    def _rewrite(worker: int) -> None:
+        try:
+            barrier.wait()
+            for round_ in range(rewrites):
+                fetched = backend.get(record.content_id)
+                assert fetched is not None
+                current, _ = fetched
+                updated = current.model_copy(
+                    update={"error_message": f"worker-{worker}-{round_}"}
+                )
+                backend.update_record(updated, sign_record(updated, _OLD_KEY))
+        except Exception as exc:  # surfaced through the assertion below
+            errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(_rewrite, range(workers)))
+
+    assert errors == []
+    stored = backend.get(record.content_id)
+    assert stored is not None
+    final, stored_signature = stored
+    # The final row is exactly one worker's last write (round index 4), not a
+    # blend of interleaved writes, and its signature matches its payload.
+    assert final.error_message is not None
+    assert final.error_message.startswith("worker-")
+    assert final.error_message.endswith("-4")
+    assert stored_signature == sign_record(final, _OLD_KEY)
+    backend.close()
