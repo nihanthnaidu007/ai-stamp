@@ -29,7 +29,7 @@ import hmac as hmac_lib
 import json
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from pydantic import SecretStr
@@ -376,6 +376,90 @@ def _fetch_scope_records(
         offset += len(report.records)
         if not report.records or offset >= report.total_count:
             return records
+
+
+
+# ---------------------------------------------------------------------------
+# Purge-anchor signatures (security audit follow-up: signed retention journal)
+# ---------------------------------------------------------------------------
+
+_PURGE_ANCHOR_CONTEXT = b"aistamp.purge-anchor.v1"
+
+
+def _purge_anchor_bytes(anchor: PurgeAnchor) -> bytes:
+    """Canonical byte form of a purge anchor, for HMAC signing.
+
+    The anchor ``id`` is excluded: it is assigned by the database on flush,
+    so a pre-persist anchor and its persisted row must produce identical
+    bytes. Datetimes are normalized to UTC so signatures created before
+    persistence verify against anchors read back from SQLite or PostgreSQL.
+    """
+    parts = [
+        _PURGE_ANCHOR_CONTEXT,
+        _utc_datetime_bytes(anchor.purged_before),
+        str(anchor.purged_count).encode(),
+        json.dumps(
+            anchor.deleted_prev_hashes, separators=(",", ":"), sort_keys=True
+        ).encode(),
+        _utc_datetime_bytes(anchor.anchor_created_at),
+    ]
+    return b"\x00".join(parts)
+
+
+def _utc_datetime_bytes(value: datetime) -> bytes:
+    """UTC ISO-8601 bytes for a naive-or-aware datetime."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().encode()
+
+
+def sign_purge_anchor(anchor: PurgeAnchor, secret_key: str | SecretStr) -> str:
+    """HMAC-sign a purge anchor so journal rows cannot be forged after the fact.
+
+    Same key material as record signatures: the anchor journal is only as
+    trustworthy as the records it vouches for. Callers pass this as
+    ``backend.purge(..., anchor_signer=...)`` so the signature is written in
+    the same transaction as the deletes.
+    """
+    key = (
+        secret_key.get_secret_value()
+        if isinstance(secret_key, SecretStr)
+        else secret_key
+    )
+    return hmac_lib.new(
+        key.encode(), _purge_anchor_bytes(anchor), hashlib.sha256
+    ).hexdigest()
+
+
+def verify_purge_anchor(
+    anchor: PurgeAnchor,
+    secret_key: str | SecretStr,
+    *,
+    anchor_signer: Callable[[PurgeAnchor], str] | None = None,
+) -> bool:
+    """True when ``anchor.signature`` is a valid HMAC over the anchor contents.
+
+    Anchors written before signing was enabled carry ``signature=None``;
+    they verify as ``False`` (an unsigned voucher proves nothing) unless an
+    ``anchor_signer`` callback is supplied to reproduce the expected
+    signature for signers that cannot persist it themselves.
+    """
+    if anchor_signer is not None:
+        expected = anchor_signer(anchor)
+    elif anchor.signature is None:
+        return False
+    else:
+        key = (
+            secret_key.get_secret_value()
+            if isinstance(secret_key, SecretStr)
+            else secret_key
+        )
+        expected = hmac_lib.new(
+            key.encode(), _purge_anchor_bytes(anchor), hashlib.sha256
+        ).hexdigest()
+    if anchor.signature is None:
+        return False
+    return hmac_lib.compare_digest(anchor.signature, expected)
 
 
 def _purged_back_references(anchors: Sequence[PurgeAnchor]) -> set[str | None]:

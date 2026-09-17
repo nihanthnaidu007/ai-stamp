@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from types import TracebackType
 
@@ -85,8 +85,19 @@ class AsyncStoreBackend(ABC):
         ...
 
     @abstractmethod
-    async def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
-        """Delete records older than retention_days. Returns the deleted count."""
+    async def purge(
+        self,
+        retention_days: int,
+        *,
+        now: datetime | None = None,
+        anchor_signer: Callable[[PurgeAnchor], str] | None = None,
+    ) -> int:
+        """Delete records older than retention_days. Returns the deleted count.
+
+        Mirrors the sync purge: when ``anchor_signer`` is given, the fresh
+        PurgeAnchor is HMAC-signed inside the same transaction as the
+        deletes (verification-sweep fix 1).
+        """
         ...
 
     @abstractmethod
@@ -199,12 +210,20 @@ class _AsyncSQLAlchemyBackend(AsyncStoreBackend):
                 next_cursor=next_cursor,
             )
 
-    async def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
+    async def purge(
+        self,
+        retention_days: int,
+        *,
+        now: datetime | None = None,
+        anchor_signer: Callable[[PurgeAnchor], str] | None = None,
+    ) -> int:
         """Delete records older than retention_days. Returns the deleted count.
 
         Every purge writes a PurgeAnchor in the SAME transaction as the
         deletes (security audit P1-5) — see the sync backend for the full
-        chain-detectability rationale.
+        chain-detectability rationale. When ``anchor_signer`` is given, the
+        anchor is HMAC-signed inside the same transaction (verification-sweep
+        fix 1).
         """
         cutoff = _retention_cutoff(retention_days, now)
         run_at = _to_naive_utc(now if now is not None else datetime.now(timezone.utc))
@@ -225,12 +244,23 @@ class _AsyncSQLAlchemyBackend(AsyncStoreBackend):
             )
             if not doomed_hashes:
                 return 0
+            anchor = PurgeAnchor(
+                id=0,  # assigned by the DB on flush; excluded from the signature
+                purged_before=cutoff,
+                purged_count=len(doomed_hashes),
+                deleted_prev_hashes=doomed_hashes,
+                anchor_created_at=run_at,
+                signature=None,
+            )
+            if anchor_signer is not None:
+                anchor = anchor.model_copy(update={"signature": anchor_signer(anchor)})
             session.add(
                 PurgeAnchorORM(
-                    purged_before=cutoff,
-                    purged_count=len(doomed_hashes),
-                    deleted_prev_hashes=doomed_hashes,
-                    anchor_created_at=run_at,
+                    purged_before=anchor.purged_before,
+                    purged_count=anchor.purged_count,
+                    deleted_prev_hashes=anchor.deleted_prev_hashes,
+                    anchor_created_at=anchor.anchor_created_at,
+                    signature=anchor.signature,
                 )
             )
             await session.execute(

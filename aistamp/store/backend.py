@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from types import TracebackType
 from typing import Any
@@ -99,8 +99,19 @@ class StoreBackend(ABC):
         ...
 
     @abstractmethod
-    def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
-        """Delete records older than retention_days. Returns the deleted count."""
+    def purge(
+        self,
+        retention_days: int,
+        *,
+        now: datetime | None = None,
+        anchor_signer: Callable[[PurgeAnchor], str] | None = None,
+    ) -> int:
+        """Delete records older than retention_days. Returns the deleted count.
+
+        When ``anchor_signer`` is given, the fresh PurgeAnchor is HMAC-signed
+        with it in the same transaction as the deletes, so the retention
+        journal itself is tamper-evident.
+        """
         ...
 
     @abstractmethod
@@ -434,10 +445,16 @@ class _SyncSQLAlchemyBackend(StoreBackend):
         with Session(self._engine) as session:
             # Row lock closes the read-modify-write race between concurrent
             # updaters (e.g. rotation re-signing vs. a concurrent finalize):
-            # PostgreSQL renders SELECT ... FOR UPDATE; SQLite ignores the
-            # clause and gets the equivalent serialization from its
-            # database-level write lock plus busy_timeout (see
+            # PostgreSQL renders SELECT ... FOR UPDATE. SQLite has no row
+            # locks and ignores the clause — a deferred transaction could
+            # read a stale snapshot and then fail its write upgrade with
+            # BUSY_SNAPSHOT (busy_timeout does not retry snapshot conflicts),
+            # so the transaction is opened with BEGIN IMMEDIATE instead: the
+            # write lock is held before the read and concurrent writers
+            # serialize politely under the pragma's busy timeout (see
             # _register_sqlite_pragmas).
+            if self._engine.dialect.name != "postgresql":
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             stmt = (
                 select(ProvenanceRecordORM)
                 .where(ProvenanceRecordORM.content_id == record.content_id)
@@ -512,14 +529,21 @@ class _SyncSQLAlchemyBackend(StoreBackend):
                 next_cursor=next_cursor,
             )
 
-    def purge(self, retention_days: int, *, now: datetime | None = None) -> int:
+    def purge(
+        self,
+        retention_days: int,
+        *,
+        now: datetime | None = None,
+        anchor_signer: Callable[[PurgeAnchor], str] | None = None,
+    ) -> int:
         """Delete records older than retention_days. Returns the deleted count.
 
         Every purge writes a PurgeAnchor in the SAME transaction as the
         deletes, listing the chain positions (prev_hash values) removed:
         a later chain gap is either anchored (legitimate retention) or
         unexplained (tampering evidence). Chain-linked deletion is never
-        silent. (Security audit P1-5.)
+        silent. (Security audit P1-5.) When ``anchor_signer`` is given, the
+        anchor is HMAC-signed before persistence.
         """
         cutoff = _retention_cutoff(retention_days, now)
         run_at = _to_naive_utc(now if now is not None else datetime.now(timezone.utc))
@@ -538,12 +562,27 @@ class _SyncSQLAlchemyBackend(StoreBackend):
             )
             if not doomed_hashes:
                 return 0
+            # The anchor is signed BEFORE persistence (the DB-assigned id is
+            # excluded from the signature payload), so the journal row lands
+            # already signed — one transaction, no unsigned window.
+            unsigned_anchor = PurgeAnchor(
+                id=0,
+                purged_before=cutoff,
+                purged_count=len(doomed_hashes),
+                deleted_prev_hashes=doomed_hashes,
+                anchor_created_at=run_at,
+                signature=None,
+            )
+            signature = (
+                anchor_signer(unsigned_anchor) if anchor_signer is not None else None
+            )
             session.add(
                 PurgeAnchorORM(
-                    purged_before=cutoff,
-                    purged_count=len(doomed_hashes),
-                    deleted_prev_hashes=doomed_hashes,
-                    anchor_created_at=run_at,
+                    purged_before=unsigned_anchor.purged_before,
+                    purged_count=unsigned_anchor.purged_count,
+                    deleted_prev_hashes=unsigned_anchor.deleted_prev_hashes,
+                    anchor_created_at=unsigned_anchor.anchor_created_at,
+                    signature=signature,
                 )
             )
             session.execute(

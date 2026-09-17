@@ -8,8 +8,10 @@ from aistamp.fingerprint.core import (
     generate_content_id,
     hash_content,
     record_hash,
+    sign_purge_anchor,
     sign_record,
     verify_chain,
+    verify_purge_anchor,
     verify_record,
     verify_record_async,
 )
@@ -44,8 +46,10 @@ __all__ = [
     "hash_content",
     "record_hash",
     "rotate_secret",
+    "sign_purge_anchor",
     "sign_record",
     "verify_chain",
+    "verify_purge_anchor",
     "verify_record",
     "verify_record_async",
 ]

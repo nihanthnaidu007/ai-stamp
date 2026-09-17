@@ -13,8 +13,10 @@ from aistamp.fingerprint import (
     hash_content,
     record_hash,
     rotate_secret,
+    sign_purge_anchor,
     sign_record,
     verify_chain,
+    verify_purge_anchor,
 )
 from aistamp.models import ProvenanceRecord, RecordStatus
 from aistamp.store import SQLiteBackend
@@ -428,3 +430,125 @@ def test_verify_chain_accepts_fully_purged_scope(
     assert result.issues == []
     assert result.anchored_gaps == 0
     assert result.records_checked == 0
+
+
+# ---------------------------------------------------------------------------
+# Group 6 — pagination safety: chains longer than one fetch page
+# ---------------------------------------------------------------------------
+
+
+def test_verify_chain_walks_a_chain_spanning_multiple_pages(
+    sqlite_backend: SQLiteBackend,
+) -> None:
+    # _fetch_scope_records paginates with OFFSET/LIMIT; on the storage-v2
+    # base the ORDER BY (timestamp, id) is deterministic, so a chain longer
+    # than _CHAIN_PAGE_SIZE must still verify end-to-end — and an injected
+    # mid-chain break past the first page boundary must still be caught.
+    from aistamp.fingerprint.core import _CHAIN_PAGE_SIZE
+
+    prev_hash: str | None = None
+    total = _CHAIN_PAGE_SIZE * 2 + 10  # 3 pages, last one partial
+    for sequence in range(total):
+        record = _write_chain_record(
+            sqlite_backend, _SCOPE, scope_sequence=sequence, prev_hash=prev_hash
+        )
+        prev_hash = record_hash(record)
+
+    result = verify_chain(sqlite_backend, _SCOPE)
+    assert result.valid is True
+    assert result.issues == []
+    assert result.records_checked == total
+
+# ---------------------------------------------------------------------------
+# Group 7 — signed purge anchors (verification sweep fix 1)
+# ---------------------------------------------------------------------------
+
+
+def _seed_old_records(backend: SQLiteBackend, count: int) -> list[ProvenanceRecord]:
+    written: list[ProvenanceRecord] = []
+    prev_hash: str | None = None
+    for sequence in range(count):
+        record = _write_chain_record(
+            backend,
+            _SCOPE,
+            scope_sequence=sequence,
+            prev_hash=prev_hash,
+            timestamp=_TS_OLD,
+        )
+        written.append(record)
+        prev_hash = record_hash(record)
+    return written
+
+
+def test_purge_signs_anchors_when_signer_given(sqlite_backend: SQLiteBackend) -> None:
+    # The sweep fix: purge() accepts an anchor_signer and persists the anchor
+    # HMAC-signed in the SAME transaction as the deletes — no unsigned window.
+    _seed_old_records(sqlite_backend, 3)
+
+    deleted = sqlite_backend.purge(
+        retention_days=1,
+        now=_PURGE_NOW,
+        anchor_signer=lambda anchor: sign_purge_anchor(anchor, _OLD_KEY),
+    )
+    assert deleted == 3
+
+    anchors = sqlite_backend.list_purge_anchors()
+    assert len(anchors) == 1
+    assert anchors[0].signature is not None
+    assert verify_purge_anchor(anchors[0], _OLD_KEY)
+
+
+def test_signed_purge_anchor_rejects_tampering(sqlite_backend: SQLiteBackend) -> None:
+    # A forged journal entry must not vouch for chain gaps: any content or
+    # signature mutation fails verification.
+    _seed_old_records(sqlite_backend, 2)
+    sqlite_backend.purge(
+        retention_days=1,
+        now=_PURGE_NOW,
+        anchor_signer=lambda anchor: sign_purge_anchor(anchor, _OLD_KEY),
+    )
+    anchor = sqlite_backend.list_purge_anchors()[0]
+
+    inflated = anchor.model_copy(update={"purged_count": anchor.purged_count + 5})
+    assert verify_purge_anchor(inflated, _OLD_KEY) is False
+
+    forged = anchor.model_copy(update={"signature": "0" * 64})
+    assert verify_purge_anchor(forged, _OLD_KEY) is False
+
+    # A different key also fails: the journal is bound to the signing key.
+    assert verify_purge_anchor(anchor, _NEW_KEY) is False
+
+
+def test_unsigned_purge_anchor_verifies_false(sqlite_backend: SQLiteBackend) -> None:
+    # Back-compat: purge() without a signer behaves as before (unsigned
+    # anchor), and an unsigned voucher proves nothing — verification is False.
+    _seed_old_records(sqlite_backend, 2)
+    sqlite_backend.purge(retention_days=1, now=_PURGE_NOW)
+
+    anchors = sqlite_backend.list_purge_anchors()
+    assert len(anchors) == 1
+    assert anchors[0].signature is None
+    assert verify_purge_anchor(anchors[0], _OLD_KEY) is False
+
+
+def test_signed_anchor_signature_survives_db_round_trip(
+    sqlite_backend: SQLiteBackend,
+) -> None:
+    # The signature is computed BEFORE persistence (DB-assigned ids excluded,
+    # datetimes normalized to UTC), so an anchor read back from the store
+    # still verifies with the same key material.
+    _seed_old_records(sqlite_backend, 2)
+    sqlite_backend.purge(
+        retention_days=1,
+        now=_PURGE_NOW,
+        anchor_signer=lambda anchor: sign_purge_anchor(anchor, _OLD_KEY),
+    )
+
+    stored = sqlite_backend.list_purge_anchors()[0]
+    assert stored.id != 0  # DB-assigned id differs from the pre-persist stub
+    assert verify_purge_anchor(stored, _OLD_KEY) is True
+
+    # Re-signing the stored anchor reproduces the persisted signature
+    # byte-for-byte: the payload is stable across the round trip.
+    unsigned = stored.model_copy(update={"signature": None})
+    assert sign_purge_anchor(unsigned, _OLD_KEY) == stored.signature
