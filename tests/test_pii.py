@@ -324,7 +324,7 @@ def test_spacy_unavailable_does_not_raise(monkeypatch: pytest.MonkeyPatch) -> No
     # If spaCy is not installed, use_spacy=True must not raise.
     from aistamp.pii import scanner as scanner_mod
 
-    def fake_scan(_text: str):
+    def fake_scan(_text: str, _config: object):
         return []
 
     monkeypatch.setattr(scanner_mod, "_scan_with_spacy", fake_scan)
@@ -449,7 +449,7 @@ def test_highest_severity_reflects_maximum() -> None:
     # If prompt has MEDIUM and response has HIGH, highest_severity must be HIGH.
     result = scan_prompt_and_response(
         "Email me at alice@example.com",
-        "SSN on file: 987-65-4321",
+        "SSN on file: 812-65-4321",
     )
     assert result.highest_severity == PIISeverity.HIGH
 
